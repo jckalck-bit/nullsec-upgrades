@@ -1,6 +1,5 @@
 name: Publish approved mod release
 on:
-  workflow_dispatch:
   push:
     branches: [main]
     paths: ['release/request.json']
@@ -14,24 +13,43 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Validate and restore approved assets
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Build approved source
         run: |
           python - <<'PY'
-          import json, pathlib, base64, hashlib, re, zipfile
+          import json, pathlib, hashlib, re, zipfile, subprocess, ast, os
           root=pathlib.Path('release')
           req=json.loads((root/'request.json').read_text())
           v=req['version']
           assert re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?',v)
+          src=pathlib.Path('src/nullsec-upgrades')
+          manifest=json.loads((src/'evejs-launcher.mod.json').read_text())
+          assert str(manifest['version'])==v
+          files=sorted(p for p in src.rglob('*') if p.is_file())
+          assert files and all(not p.is_symlink() for p in files)
+          actual={p.relative_to(src).as_posix():hashlib.sha256(p.read_bytes()).hexdigest() for p in files}
+          assert actual==req['files'], 'Approved source hashes do not match'
+          for p in files:
+              if p.name.endswith(('.js','.js.disabled')):
+                  subprocess.run(['node','--check','-'],input=p.read_bytes(),check=True)
+              elif p.suffix=='.json':
+                  json.loads(p.read_text())
+              elif p.suffix=='.py':
+                  ast.parse(p.read_text())
           name=f'nullsec-upgrades-{v}.zip'
-          data=base64.b64decode((root/'package.b64').read_text())
-          assert hashlib.sha256(data).hexdigest()==req['sha256']
-          pathlib.Path(name).write_bytes(data)
+          with zipfile.ZipFile(name,'w',zipfile.ZIP_DEFLATED) as z:
+              for p in files:
+                  z.write(p,'nullsec-upgrades/'+p.relative_to(src).as_posix())
           with zipfile.ZipFile(name) as z:
               assert z.testzip() is None
           meta=json.loads((root/'update.json').read_text())
           assert meta['version']==v and meta['id']=='nullsec-upgrades' and meta['asset']==name
-          pathlib.Path(name.replace('.zip','.update.json')).write_text(json.dumps(meta,indent=2))
-          with open(__import__('os').environ['GITHUB_ENV'],'a') as f:
+          assert hashlib.sha256((root/'update.json').read_bytes()).hexdigest()==req['metadata_sha256']
+          assert hashlib.sha256((root/'CHANGELOG.md').read_bytes()).hexdigest()==req['changelog_sha256']
+          pathlib.Path(name.replace('.zip','.update.json')).write_bytes((root/'update.json').read_bytes())
+          with open(os.environ['GITHUB_ENV'],'a') as f:
               f.write(f'VERSION={v}\nASSET={name}\n')
           PY
       - name: Publish approved release
