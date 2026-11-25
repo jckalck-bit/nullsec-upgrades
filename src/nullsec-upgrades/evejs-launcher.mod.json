@@ -1,0 +1,532 @@
+{
+  "schemaVersion": 3,
+  "id": "nullsec-upgrades",
+  "displayName": "Nullsec upgrades",
+  "version": "1.2.2",
+  "description": "Sovereignty mining upgrades, persistent respawn timers, mining escalations, and optional automatic planetary resources.",
+  "kind": "loader",
+  "supportedBackends": [
+    "native",
+    "docker"
+  ],
+  "activation": {
+    "strategy": "loader_rename"
+  },
+  "restart": "game_server",
+  "settings": {
+    "schemaVersion": 1,
+    "files": [
+      {
+        "id": "options",
+        "base": "evejs",
+        "path": "config/nullsec-upgrades.json",
+        "format": "json"
+      }
+    ],
+    "fields": [
+      {
+        "id": "miningEscalations",
+        "label": "Mining escalations",
+        "description": "Roll for an escalation after a mining site is depleted.",
+        "group": "Mining escalations",
+        "type": "boolean",
+        "default": false,
+        "restart": "game_server",
+        "file": "options",
+        "key": [
+          "miningEscalations"
+        ]
+      },
+      {
+        "id": "escalationChanceArray1",
+        "label": "Array 1 escalation chance (%)",
+        "description": "Percentage chance after depletion for this Array.",
+        "group": "Mining escalations",
+        "type": "number",
+        "default": 5,
+        "restart": "game_server",
+        "file": "options",
+        "key": [
+          "escalationChanceArray1"
+        ],
+        "minimum": 0,
+        "maximum": 100,
+        "step": 0.01
+      },
+      {
+        "id": "escalationChanceArray2",
+        "label": "Array 2 escalation chance (%)",
+        "description": "Percentage chance after depletion for this Array.",
+        "group": "Mining escalations",
+        "type": "number",
+        "default": 15,
+        "restart": "game_server",
+        "file": "options",
+        "key": [
+          "escalationChanceArray2"
+        ],
+        "minimum": 0,
+        "maximum": 100,
+        "step": 0.01
+      },
+      {
+        "id": "escalationChanceArray3",
+        "label": "Array 3 escalation chance (%)",
+        "description": "Percentage chance after depletion for this Array.",
+        "group": "Mining escalations",
+        "type": "number",
+        "default": 25,
+        "restart": "game_server",
+        "file": "options",
+        "key": [
+          "escalationChanceArray3"
+        ],
+        "minimum": 0,
+        "maximum": 100,
+        "step": 0.01
+      },
+      {
+        "id": "oreScaling",
+        "label": "Ore scaling",
+        "description": "Increase ore quantities in sovereignty mining sites and escalations.",
+        "group": "Ore scaling",
+        "type": "boolean",
+        "default": false,
+        "restart": "game_server",
+        "file": "options",
+        "key": [
+          "oreScaling"
+        ]
+      },
+      {
+        "id": "oreScaling1",
+        "label": "Array 1 ore bonus (%)",
+        "description": "Additional ore percentage for this Array; escalations use Array 3.",
+        "group": "Ore scaling",
+        "type": "number",
+        "default": 10,
+        "restart": "game_server",
+        "file": "options",
+        "key": [
+          "oreScaling1"
+        ],
+        "minimum": 0,
+        "maximum": 99900,
+        "step": 0.01
+      },
+      {
+        "id": "oreScaling2",
+        "label": "Array 2 ore bonus (%)",
+        "description": "Additional ore percentage for this Array; escalations use Array 3.",
+        "group": "Ore scaling",
+        "type": "number",
+        "default": 20,
+        "restart": "game_server",
+        "file": "options",
+        "key": [
+          "oreScaling2"
+        ],
+        "minimum": 0,
+        "maximum": 99900,
+        "step": 0.01
+      },
+      {
+        "id": "oreScaling3",
+        "label": "Array 3 ore bonus (%)",
+        "description": "Additional ore percentage for this Array; escalations use Array 3.",
+        "group": "Ore scaling",
+        "type": "number",
+        "default": 30,
+        "restart": "game_server",
+        "file": "options",
+        "key": [
+          "oreScaling3"
+        ],
+        "minimum": 0,
+        "maximum": 99900,
+        "step": 0.01
+      },
+      {
+        "id": "strictMiningSiteSize",
+        "label": "Strict mining site size",
+        "description": "Only spawn Small, Medium or Large sovereignty mining sites for Arrays 1, 2 or 3 respectively.",
+        "group": "Mining site size",
+        "type": "boolean",
+        "default": false,
+        "restart": "game_server",
+        "file": "options",
+        "key": [
+          "strictMiningSiteSize"
+        ]
+      },
+      {
+        "id": "tierDistribution",
+        "label": "Mining site tier distribution",
+        "description": "Customize ore grade volume shares in sovereignty mining sites.",
+        "group": "Mining site tier distribution",
+        "type": "boolean",
+        "default": false,
+        "restart": "game_server",
+        "file": "options",
+        "key": [
+          "tierDistribution"
+        ]
+      },
+      {
+        "id": "arrayDistribution",
+        "label": "Scale tier distribution by Array level",
+        "description": "Use Array-specific grade shares when custom distribution is enabled.",
+        "group": "Mining site tier distribution",
+        "type": "boolean",
+        "default": false,
+        "restart": "game_server",
+        "file": "options",
+        "key": [
+          "arrayDistribution"
+        ]
+      },
+      {
+        "id": "tierRandomness",
+        "label": "Tier distribution randomness",
+        "description": "Randomize grade shares for each new site when custom distribution is enabled.",
+        "group": "Mining site tier distribution",
+        "type": "boolean",
+        "default": true,
+        "restart": "game_server",
+        "file": "options",
+        "key": [
+          "tierRandomness"
+        ]
+      },
+      {
+        "id": "tier4",
+        "label": "Tier 4 (%)",
+        "description": "Target ore grade volume percentage; all four must total 100%.",
+        "group": "Mining site tier distribution",
+        "type": "number",
+        "default": 50,
+        "restart": "game_server",
+        "file": "options",
+        "key": [
+          "tier4"
+        ],
+        "minimum": 0,
+        "maximum": 100,
+        "step": 0.01
+      },
+      {
+        "id": "tier3",
+        "label": "Tier 3 (%)",
+        "description": "Target ore grade volume percentage; all four must total 100%.",
+        "group": "Mining site tier distribution",
+        "type": "number",
+        "default": 30,
+        "restart": "game_server",
+        "file": "options",
+        "key": [
+          "tier3"
+        ],
+        "minimum": 0,
+        "maximum": 100,
+        "step": 0.01
+      },
+      {
+        "id": "tier2",
+        "label": "Tier 2 (%)",
+        "description": "Target ore grade volume percentage; all four must total 100%.",
+        "group": "Mining site tier distribution",
+        "type": "number",
+        "default": 15,
+        "restart": "game_server",
+        "file": "options",
+        "key": [
+          "tier2"
+        ],
+        "minimum": 0,
+        "maximum": 100,
+        "step": 0.01
+      },
+      {
+        "id": "tier1",
+        "label": "Tier 1 (%)",
+        "description": "Target ore grade volume percentage; all four must total 100%.",
+        "group": "Mining site tier distribution",
+        "type": "number",
+        "default": 5,
+        "restart": "game_server",
+        "file": "options",
+        "key": [
+          "tier1"
+        ],
+        "minimum": 0,
+        "maximum": 100,
+        "step": 0.01
+      },
+      {
+        "group": "Mining site respawn",
+        "restart": "game_server",
+        "file": "options",
+        "id": "instantSiteRespawn",
+        "label": "Instant site respawn",
+        "description": "Immediately replaces depleted standard mining sites. Default timers: Array 1: 60 min (1h); Array 2: 260 min (4h 20m); Array 3: 600 min (10h).",
+        "type": "boolean",
+        "default": false,
+        "key": [
+          "instantSiteRespawn"
+        ]
+      },
+      {
+        "group": "Mining site respawn",
+        "restart": "game_server",
+        "file": "options",
+        "id": "respawnMinutesArray1",
+        "label": "Array 1 respawn timer (minutes)",
+        "description": "Retail default: 60 minutes. Starts at full depletion. Ignored when Instant site respawn is enabled.",
+        "type": "number",
+        "default": 60,
+        "key": [
+          "respawnMinutesArray1"
+        ],
+        "minimum": 0,
+        "maximum": 525600,
+        "step": 0.01
+      },
+      {
+        "group": "Mining site respawn",
+        "restart": "game_server",
+        "file": "options",
+        "id": "respawnMinutesArray2",
+        "label": "Array 2 respawn timer (minutes)",
+        "description": "Retail default: 260 minutes. Starts at full depletion. Ignored when Instant site respawn is enabled.",
+        "type": "number",
+        "default": 260,
+        "key": [
+          "respawnMinutesArray2"
+        ],
+        "minimum": 0,
+        "maximum": 525600,
+        "step": 0.01
+      },
+      {
+        "group": "Mining site respawn",
+        "restart": "game_server",
+        "file": "options",
+        "id": "respawnMinutesArray3",
+        "label": "Array 3 respawn timer (minutes)",
+        "description": "Retail default: 600 minutes. Starts at full depletion. Ignored when Instant site respawn is enabled.",
+        "type": "number",
+        "default": 600,
+        "key": [
+          "respawnMinutesArray3"
+        ],
+        "minimum": 0,
+        "maximum": 525600,
+        "step": 0.01
+      },
+      {
+        "id": "mercoxitSites",
+        "label": "On/Off",
+        "type": "boolean",
+        "default": false,
+        "description": "Level 3 Arrays only. Reserve sites accumulate while mining; queued sites immediately replace depleted deposits. Timer pauses at maximum queue.",
+        "group": "Mercoxit sites",
+        "restart": "game_server",
+        "file": "options",
+        "key": [
+          "mercoxitSites"
+        ]
+      },
+      {
+        "id": "mercoxitRespawnHours",
+        "label": "Respawn timer (h)",
+        "type": "integer",
+        "default": 12,
+        "description": "Hours between reserve deposits; zero enables immediate replacement.",
+        "group": "Mercoxit sites",
+        "restart": "game_server",
+        "file": "options",
+        "key": [
+          "mercoxitRespawnHours"
+        ],
+        "minimum": 0,
+        "step": 1
+      },
+      {
+        "id": "mercoxitMaxQueued",
+        "label": "Max queued",
+        "type": "integer",
+        "default": 3,
+        "description": "Maximum reserve deposits, excluding the active deposit.",
+        "group": "Mercoxit sites",
+        "restart": "game_server",
+        "file": "options",
+        "key": [
+          "mercoxitMaxQueued"
+        ],
+        "minimum": 0,
+        "step": 1
+      },
+      {
+        "id": "industrialIndexProgression",
+        "label": "On/Off",
+        "group": "Industrial index progression",
+        "type": "boolean",
+        "default": false,
+        "description": "Award industrial development points for player mining in claimed nullsec.",
+        "restart": "game_server",
+        "file": "options",
+        "key": [
+          "industrialIndexProgression"
+        ]
+      },
+      {
+        "id": "industrialIndexMultiplier",
+        "label": "Progression multiplier",
+        "group": "Industrial index progression",
+        "type": "number",
+        "default": 1,
+        "description": "Multiplier applied to mined volume.",
+        "restart": "game_server",
+        "file": "options",
+        "key": [
+          "industrialIndexMultiplier"
+        ],
+        "minimum": 0,
+        "maximum": 100,
+        "step": 0.01
+      },
+      {
+        "id": "industrialIndexDecay",
+        "label": "On/Off",
+        "group": "Industrial index decay",
+        "type": "boolean",
+        "default": false,
+        "description": "Reduce accumulated industrial points over elapsed time.",
+        "restart": "game_server",
+        "file": "options",
+        "key": [
+          "industrialIndexDecay"
+        ]
+      },
+      {
+        "id": "industrialIndexDecayRate",
+        "label": "Decay rate (% per day)",
+        "group": "Industrial index decay",
+        "type": "number",
+        "default": 1,
+        "description": "Daily percentage loss: 0.20 means 0.20% per day; 1 means 1% per day.",
+        "restart": "game_server",
+        "file": "options",
+        "key": [
+          "industrialIndexDecayRate"
+        ],
+        "minimum": 0,
+        "maximum": 100,
+        "step": 0.01
+      },
+      {
+        "id": "indexPoints",
+        "label": "Index points",
+        "description": "Expose the combined sovereignty index levels (0\u201315) to other mods.",
+        "group": "Sovereignty index benefits",
+        "type": "boolean",
+        "default": false,
+        "restart": "game_server",
+        "file": "options",
+        "key": [
+          "indexPoints"
+        ]
+      },
+      {
+        "id": "indexEscalation",
+        "label": "Mining escalation chance",
+        "description": "Add one percentage point per Index Point at server startup.",
+        "group": "Sovereignty index benefits",
+        "type": "boolean",
+        "default": false,
+        "restart": "game_server",
+        "file": "options",
+        "key": [
+          "indexEscalation"
+        ]
+      },
+      {
+        "id": "indexResources",
+        "label": "System power/workforce boost",
+        "description": "Add 1% local power and workforce per Index Point at server startup.",
+        "group": "Sovereignty index benefits",
+        "type": "boolean",
+        "default": false,
+        "restart": "game_server",
+        "file": "options",
+        "key": [
+          "indexResources"
+        ]
+      },
+      {
+        "id": "automaticPlanetaryResources",
+        "label": "Automatic planetary resources",
+        "description": "Use natural system power and workforce without requiring physical skyhooks. Native workforce transfers remain active.",
+        "group": "General settings",
+        "type": "boolean",
+        "default": false,
+        "restart": "game_server",
+        "file": "options",
+        "key": [
+          "automaticPlanetaryResources"
+        ]
+      },
+      {
+        "id": "commands",
+        "label": "Commands",
+        "description": "Enable both staff mining commands independently of gameplay toggles.",
+        "group": "General settings",
+        "type": "boolean",
+        "default": false,
+        "restart": "game_server",
+        "file": "options",
+        "key": [
+          "commands"
+        ]
+      },
+      {
+        "id": "resetNullSpawnedSites",
+        "label": "Reset mining sites",
+        "description": "Reset sovereignty mining sites at next startup; turns off after successful reset.",
+        "group": "General settings",
+        "type": "boolean",
+        "default": false,
+        "restart": "game_server",
+        "file": "options",
+        "key": [
+          "resetNullSpawnedSites"
+        ]
+      },
+      {
+        "id": "verboseLogging",
+        "label": "Verbose Logging",
+        "description": "Enable mod logging; OFF suppresses mod logs.",
+        "group": "General settings",
+        "type": "boolean",
+        "default": false,
+        "restart": "game_server",
+        "file": "options",
+        "key": [
+          "verboseLogging"
+        ]
+      }
+    ]
+  },
+  "clientMenu": {
+    "apiVersion": 1,
+    "entrypoint": "client/menu.py"
+  },
+  "updates": {
+    "provider": "github",
+    "repository": "jckalck-bit/nullsec-upgrades",
+    "asset": "nullsec-upgrades-{version}.zip",
+    "channel": "stable",
+    "tagPrefix": "v",
+    "preserveFiles": []
+  }
+}

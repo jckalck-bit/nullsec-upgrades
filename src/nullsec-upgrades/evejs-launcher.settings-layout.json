@@ -1,0 +1,155 @@
+{
+  "schemaVersion": 1,
+  "sections": [
+    {
+      "id": "escalations",
+      "title": {
+        "en": "Mining escalations"
+      },
+      "rows": [
+        [
+          "miningEscalations"
+        ],
+        [
+          "escalationChanceArray1",
+          "escalationChanceArray2",
+          "escalationChanceArray3"
+        ]
+      ]
+    },
+    {
+      "id": "ore",
+      "title": {
+        "en": "Ore scaling"
+      },
+      "rows": [
+        [
+          "oreScaling"
+        ],
+        [
+          "oreScaling1",
+          "oreScaling2",
+          "oreScaling3"
+        ]
+      ]
+    },
+    {
+      "id": "size",
+      "title": {
+        "en": "Mining site size"
+      },
+      "rows": [
+        [
+          "strictMiningSiteSize"
+        ]
+      ]
+    },
+    {
+      "id": "tier",
+      "title": {
+        "en": "Mining site tier distribution"
+      },
+      "rows": [
+        [
+          "tierDistribution"
+        ],
+        [
+          "arrayDistribution"
+        ],
+        [
+          "tierRandomness"
+        ],
+        [
+          "tier4",
+          "tier3"
+        ],
+        [
+          "tier2",
+          "tier1"
+        ]
+      ]
+    },
+    {
+      "id": "respawn",
+      "title": {
+        "en": "Mining site respawn"
+      },
+      "rows": [
+        [
+          "instantSiteRespawn"
+        ],
+        [
+          "respawnMinutesArray1",
+          "respawnMinutesArray2",
+          "respawnMinutesArray3"
+        ]
+      ]
+    },
+    {
+      "id": "mercoxit",
+      "title": {
+        "en": "Mercoxit sites"
+      },
+      "rows": [
+        [
+          "mercoxitSites",
+          "mercoxitRespawnHours",
+          "mercoxitMaxQueued"
+        ]
+      ]
+    },
+    {
+      "id": "industrialProgression",
+      "title": {
+        "en": "Industrial index progression"
+      },
+      "rows": [
+        [
+          "industrialIndexProgression",
+          "industrialIndexMultiplier"
+        ]
+      ]
+    },
+    {
+      "id": "industrialDecay",
+      "title": {
+        "en": "Industrial index decay"
+      },
+      "rows": [
+        [
+          "industrialIndexDecay",
+          "industrialIndexDecayRate"
+        ]
+      ]
+    },
+    {
+      "id": "indexBenefits",
+      "title": {
+        "en": "Sovereignty index benefits"
+      },
+      "rows": [
+        [
+          "indexPoints",
+          "indexEscalation",
+          "indexResources"
+        ]
+      ]
+    },
+    {
+      "id": "general",
+      "title": {
+        "en": "General settings"
+      },
+      "rows": [
+        [
+          "automaticPlanetaryResources",
+          "commands",
+          "resetNullSpawnedSites"
+        ],
+        [
+          "verboseLogging"
+        ]
+      ]
+    }
+  ]
+}

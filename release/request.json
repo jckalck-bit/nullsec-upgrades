@@ -1,0 +1,16 @@
+{
+  "version": "1.2.2",
+  "files": {
+    "index-benefits.js": "d87a36eb363b741dd348ee30cc87590b6fbfcab6e8831814cd12f59043df0e25",
+    "diagnostics.js": "f78b5b418bbbdcf96b51a2a0dcdda97b7451a00c44c2088cbcc0354110934ef9",
+    "README.md": "edf28f8cd5b6faa0a4b9ce971d15d2d951730b8610ded2e2bef2d712c4ba1bf8",
+    "industrial-index.js": "8792aa0cd81672170feba39817629baeeeb56607fb95e342f22e92976c366b07",
+    "evejs-launcher.settings-layout.json": "d1e33555ded6bc3013d00ca65ddf6b8698337b4f1567db52b49d32f26b0ff008",
+    "evejs-launcher.mod.json": "00aad03b86ad87704df4d17ed6362766dc750153989203191e32262ac5e21827",
+    "client/menu.py": "62f6f649c9ac96314841e4a3d681c98e58aedbc9a25b3064f145d5f31ffc6933",
+    "loader.js.disabled": "6152f78fdd8de6e092428d96c69fb530a2d23f6c05dfeac12131ef6bfad4b8dd",
+    "CHANGELOG.md": "ac2bc5c358214e192ecb95102c26115590d4149880ad1b41058f4cc25abed789"
+  },
+  "metadata_sha256": "d022f196e2da209f2d6effef99bcae1c3b643fce432450e44b0a1eec4052e21e",
+  "changelog_sha256": "ac2bc5c358214e192ecb95102c26115590d4149880ad1b41058f4cc25abed789"
+}

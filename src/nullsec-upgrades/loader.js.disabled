@@ -1,0 +1,1359 @@
+"use strict";
+const fs = require("node:fs");
+const path = require("node:path");
+const Module = require("node:module");
+
+const TAG = "[Nullsec upgrades]";
+const MOD_ROOT = __dirname;
+const EVEJS_ROOT = path.resolve(MOD_ROOT, "..", "..");
+const CONFIG_PATH = path.join(EVEJS_ROOT, "config", "nullsec-upgrades.json");
+const RESET_KEY = "resetNullSpawnedSites";
+const MULTIPLIER_KEYS = { 1: "prospectingArray1Multiplier", 2: "prospectingArray2Multiplier", 3: "prospectingArray3Multiplier" };
+const ESCALATIONS_KEY = "miningEscalations";
+const CHANCE_KEYS = { 1: "escalationChanceArray1", 2: "escalationChanceArray2", 3: "escalationChanceArray3" };
+const RESPAWN_DEFAULTS = { 1: 60, 2: 260, 3: 600 };
+const CHANCE_DEFAULTS = { 1: 5, 2: 15, 3: 25 };
+const TIER_KEY = "tierDistribution";
+const MAX_MULTIPLIER = 1000;
+const ESCALATION_LIFETIME_MS = 24 * 60 * 60 * 1000;
+const ESCALATION_ORIGIN = "nullsec_escalation";
+const ESCALATION_FAMILY = "nullsec_escalation";
+const ESCALATION_TEMPLATE_ID = "eve-university:Interstitial_Ore_Deposit";
+const ESCALATION_CLIENT_TEMPLATE_ID = "client-dungeon:11999"; // the client's own Interstitial Ore Deposit
+const ESCALATION_FALLBACK_NAME_ID = 724374;
+const ESCALATION_FALLBACK_DUNGEON_ID = 11999;
+const ESCALATION_SLOT_FIRST = 500; // site-ID slots 500..999 of the sov_prospecting band are unused by the game
+const ESCALATION_SLOT_LAST = 999;
+
+const round2 = (value) => Math.round(value * 100) / 100;
+
+// Ore tier mix for Prospecting Array sites (share of rocks per tier).
+const TIER_MIX = Object.freeze([
+  { grade: 3, share: 0.50 }, // tier IV
+  { grade: 2, share: 0.30 }, // tier III
+  { grade: 1, share: 0.15 }, // tier II
+  { grade: 0, share: 0.05 }, // tier I
+]);
+
+// Every ore comes in four grades, ordered tier I -> tier IV (type IDs).
+const ORE_GRADE_FAMILIES = Object.freeze([
+  [1230, 17470, 17471, 46689],   // Veldspar
+  [18, 17455, 17456, 46685],     // Plagioclase
+  [1228, 17463, 17464, 46687],   // Scordite
+  [1224, 17459, 17460, 46686],   // Pyroxeres
+  [1227, 17867, 17868, 46684],   // Omber
+  [20, 17452, 17453, 46683],     // Kernite
+  [21, 17440, 17441, 46680],     // Hedbergite
+  [22, 17425, 17426, 46678],     // Arkonor
+  [1225, 17432, 17433, 46677],   // Crokite
+  [1232, 17436, 17437, 46675],   // Dark Ochre
+  [1223, 17428, 17429, 46676],   // Bistot
+  [1229, 17865, 17866, 46679],   // Gneiss
+  [1226, 17448, 17449, 46682],   // Jaspet
+  [74521, 74522, 74523, 74524],  // Mordunium
+  [81900, 81901, 81902, 81903],  // Kylixium
+  [81975, 81976, 81977, 81978],  // Griemeer
+  [82016, 82017, 82018, 82019],  // Nocxite
+  [82163, 82164, 82165, 82166],  // Hezorime
+  [82205, 82206, 82207, 82208],  // Ueganite
+  [74529, 74530, 74531, 74532],  // Eifyrium
+  [74533, 74534, 74535, 74536],  // Ducinium
+]);
+const ORE_FAMILY_BY_TYPE = new Map();
+for (const family of ORE_GRADE_FAMILIES) family.forEach((typeID) => ORE_FAMILY_BY_TYPE.set(typeID, family));
+
+
+let verbose = false;
+function log(message) { if (!verbose) return; process.stdout.write(`${TAG} ${message}\n`); }
+function warn(message) { if (!verbose) return; process.stderr.write(`${TAG} WARNING: ${message}\n`); }
+
+function valid(v,min,max,fallback) { return typeof v === "number" && Number.isFinite(v) && v>=min && v<=max && Math.abs(v*100-Math.round(v*100))<1e-6 ? v : fallback; }
+function readConfig() {
+  const config = {
+    reset: false, escalations: false, tierMix: false,
+    indexProgression:false,indexMultiplier:1,indexDecay:false,indexDecayRate:1,
+    multipliers: { 1: 1, 2: 1, 3: 1 },
+    chances: { ...CHANCE_DEFAULTS },
+    anyMultiplier: false, instantRespawn: false, respawnMinutes: { ...RESPAWN_DEFAULTS },
+  };
+  let parsed = null;
+  try {
+    if (!fs.existsSync(CONFIG_PATH)) return config;
+    const raw = fs.readFileSync(CONFIG_PATH, "utf8").replace(/^\uFEFF/, "");
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    warn(`Could not read ${CONFIG_PATH} (${error.message}); using defaults.`);
+    return config;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return config;
+  verbose = parsed.verboseLogging === true;
+  config.commands = parsed.commands === true;
+  config.indexPoints = parsed.indexPoints === true;
+  config.indexEscalation = config.indexPoints && parsed.indexEscalation === true;
+  config.indexResources = config.indexPoints && parsed.indexResources === true;
+  config.indexProgression=parsed.industrialIndexProgression===true;
+  config.indexMultiplier=valid(parsed.industrialIndexMultiplier,0,100,1);
+  config.indexDecay=parsed.industrialIndexDecay===true;
+  config.indexDecayRate=valid(parsed.industrialIndexDecayRate,0,100,1);
+  config.mercoxit = parsed.mercoxitSites === true;
+  config.mercoxitHours = Number.isSafeInteger(parsed.mercoxitRespawnHours) && parsed.mercoxitRespawnHours >= 0 && parsed.mercoxitRespawnHours <= Math.floor(Number.MAX_SAFE_INTEGER/3600000) ? parsed.mercoxitRespawnHours : 12;
+  config.mercoxitMax = Number.isSafeInteger(parsed.mercoxitMaxQueued) && parsed.mercoxitMaxQueued >= 0 && parsed.mercoxitMaxQueued < Number.MAX_SAFE_INTEGER ? parsed.mercoxitMaxQueued : 3;
+  config.automaticPlanetaryResources = parsed.automaticPlanetaryResources === true;
+  config.instantRespawn = parsed.instantSiteRespawn === true;
+  for (const tier of [1, 2, 3]) config.respawnMinutes[tier] = valid(parsed[`respawnMinutesArray${tier}`], 0, 525600, RESPAWN_DEFAULTS[tier]);
+  config.strictMiningSiteSize = parsed.strictMiningSiteSize === true;
+  config.arrayMix = parsed.arrayDistribution === true;
+  config.randomMix = parsed.tierRandomness !== false;
+  config.weights = [4,3,2,1].map((n,i) => valid(parsed['tier'+n],0,100,[50,30,15,5][i]));
+  if (Math.abs(config.weights.reduce((a,b)=>a+b,0)-100)>0.000001) config.weights=[50,30,15,5];
+  config.reset = parsed[RESET_KEY] === true;
+  config.escalations = parsed[ESCALATIONS_KEY] === true;
+  config.tierMix = parsed[TIER_KEY] === true;
+  for (const tier of [1, 2, 3]) {
+    config.multipliers[tier] = parsed.oreScaling === true ? 1+valid(parsed['oreScaling'+tier],0,99900,tier*10)/100 : 1;
+    config.chances[tier] = valid(parsed[CHANCE_KEYS[tier]],0,100,CHANCE_DEFAULTS[tier]);
+  }
+  config.oreScaling = parsed.oreScaling === true;
+  config.anyMultiplier = [1, 2, 3].some((tier) => config.multipliers[tier] !== 1);
+  return config;
+}
+
+// Turn the reset switch off again after a successful reset, keeping every
+// other byte (other keys, comments, line endings, BOM) of the file as it is.
+function clearResetSwitch() {
+  try {
+    const original = fs.readFileSync(CONFIG_PATH, "utf8");
+    const pattern = new RegExp(`("${RESET_KEY}"\\s*:\\s*)true\\b`);
+    if (!pattern.test(original)) return false;
+    const updated = original.replace(pattern, "$1false");
+    const temporary = `${CONFIG_PATH}.${process.pid}.tmp`;
+    fs.writeFileSync(temporary, updated);
+    fs.renameSync(temporary, CONFIG_PATH);
+    return true;
+  } catch (error) {
+    warn(`Could not switch "Reset mining sites" back off: ${error.message}`);
+    return false;
+  }
+}
+
+const config = readConfig();
+config.verbose = verbose;
+const diagnostics = require("./diagnostics").create(config, log);
+log(diagnostics.report());
+const toInt = (value, fallback = 0) => {
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.trunc(number) : fallback;
+};
+
+function sovHubOf(instance) {
+  return (instance && instance.spawnState && instance.spawnState.sovHub) ||
+    (instance && instance.metadata && instance.metadata.sovHub) || null;
+}
+
+function isProspectingSite(instance) {
+  if (!instance || instance.siteOrigin !== "sov_hub" || sovHubOf(instance)?.nullsecMercoxit === true) return false;
+  const hub = sovHubOf(instance);
+  if (hub && String(hub.upgradeCategory || "").toLowerCase() === "prospecting") return true;
+  const family = (instance.metadata && instance.metadata.spawnFamilyKey) ||
+    (instance.spawnState && instance.spawnState.spawnFamilyKey) || "";
+  return String(family).toLowerCase() === "sov_prospecting";
+}
+
+// Prospecting Array tier (1-3) of a sov prospecting site, or of an escalation
+// site it produced (which remembers the tier). 0 when it is neither.
+function prospectingTier(instance) {
+  if (!instance) return 0;
+  const escalation = instance.spawnState && instance.spawnState.nullsecEscalation;
+  if (escalation && typeof escalation === "object") return toInt(escalation.tier, 0);
+  if (!isProspectingSite(instance)) return 0;
+  return toInt(sovHubOf(instance) && sovHubOf(instance).upgradeTier, 0);
+}
+
+function hashFraction(text) {
+  let hash = 2166136261;
+  for (let i = 0; i < text.length; i += 1) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 16777619) >>> 0;
+  }
+  return hash / 4294967296;
+}
+
+const gradePlanCache = new Map();
+const unitVolumeCache = new Map();
+
+function unitVolumeOf(typeID) {
+  if (unitVolumeCache.has(typeID)) return unitVolumeCache.get(typeID);
+  let volume = 1;
+  try {
+    const record = typeof internals.itemByTypeID === "function" ? internals.itemByTypeID(typeID) : null;
+    const value = Number(record && record.volume);
+    if (Number.isFinite(value) && value > 0) volume = value;
+  } catch (_) { /* fall back to 1 */ }
+  unitVolumeCache.set(typeID, volume);
+  return volume;
+}
+
+// Per site, by ore VOLUME (m3): rocks are handed out largest first, each to the
+// grade that is furthest below its TIER_MIX share of the site's total m3, so the
+// site ends up as close to 50/30/15/5 percent of its volume as whole rocks
+// allow. Same site -> same answer on every load.
+function mixFor(tier, rng = Math.random) {
+  const base = config.arrayMix ? ({1:[30,50,15,5],2:[40,40,15,5],3:[50,30,15,5]}[tier]) : config.weights;
+  let weights=base || [50,30,15,5];
+  if(config.randomMix) {
+    const bounds=config.arrayMix ? ({1:[[20,40],[40,60],[5,20],[0,5]],2:[[30,50],[30,50],[5,20],[0,5]],3:[[40,75],[20,40],[5,20],[0,5]]}[tier]) : weights.map(v=>[Math.max(0,v-10),Math.min(100,v+10)]);
+    let remaining=100;
+    weights=bounds.map(([lo,hi],i)=>{const rest=bounds.slice(i+1); const low=Math.max(lo,remaining-rest.reduce((a,b)=>a+b[1],0)); const high=Math.min(hi,remaining-rest.reduce((a,b)=>a+b[0],0)); const v=i===3?remaining:round2(low+rng()*(high-low)); remaining=round2(remaining-v); return v;});
+  }
+  return weights.map((v,i)=>({grade:3-i,share:v/100}));
+}
+function gradePlanFor(siteID, rows, instance) {
+  const key = `${instance.instanceID || siteID}:${instance.timers?.createdAtMs || 0}:${rows.length}`;
+  if (gradePlanCache.has(key)) return gradePlanCache.get(key);
+  let counter = 0;
+  const TIER_MIX = mixFor(prospectingTier(instance), () => hashFraction(`${key}:${counter++}`));
+  const eligible = [];
+  rows.forEach((rock, index) => {
+    const typeID = toInt(rock && (rock.typeID || rock.oreTypeID), 0);
+    if (!ORE_FAMILY_BY_TYPE.has(typeID)) return;
+    const quantity = Number(rock.quantity ?? rock.remainingQuantity ?? rock.quantityPerRock);
+    const units = (Number.isFinite(quantity) && quantity > 0 ? quantity : 1) * Math.max(1, toInt(rock.count, 1));
+    eligible.push({ index, m3: units * unitVolumeOf(typeID), order: hashFraction(`${siteID}:${index}`) });
+  });
+  eligible.sort((a, b) => b.m3 - a.m3 || a.order - b.order || a.index - b.index);
+  const total = eligible.reduce((sum, entry) => sum + entry.m3, 0);
+  const assigned = new Map(TIER_MIX.map((tier) => [tier.grade, 0]));
+  const plan = new Map();
+  for (const entry of eligible) {
+    let best = TIER_MIX[0];
+    let bestDeficit = -Infinity;
+    for (const tier of TIER_MIX) { // TIER_MIX is ordered best grade first, so ties favour the better tier
+      const deficit = tier.share * total - assigned.get(tier.grade);
+      if (deficit > bestDeficit) { bestDeficit = deficit; best = tier; }
+    }
+    assigned.set(best.grade, assigned.get(best.grade) + entry.m3);
+    plan.set(entry.index, best.grade);
+  }
+  if (gradePlanCache.size > 2000) gradePlanCache.clear();
+  gradePlanCache.set(key, plan);
+  const sharesOK = Math.abs(TIER_MIX.reduce((n,t)=>n+t.share,0)-1)<1e-6;
+  for(const feature of ["tierDistribution","arrayDistribution","tierRandomness"]) diagnostics.mark(feature,sharesOK ? null : false,"Grade plan shares checked; actual rock volumes awaiting independent verification");
+  return plan;
+}
+
+const internals = {
+  rocks: null, // buildMiningRockEntities, handed over by the patched site service
+  itemByTypeID: null, // resolveItemByTypeID, handed over by the patched site service
+  pickOreType(instance, populationHints, rowIndex, original) {
+    try {
+      if (!isProspectingSite(instance) || prospectingTier(instance) < 1) return original;
+      const family = ORE_FAMILY_BY_TYPE.get(toInt(original, 0));
+      if (!family || !populationHints || !Array.isArray(populationHints.miningRocks)) return original;
+      const siteID = toInt(instance.metadata && instance.metadata.siteID, 0) ||
+        toInt(instance.spawnState && instance.spawnState.siteID, 0);
+      if (siteID <= 0) return original;
+      const grade = gradePlanFor(siteID, populationHints.miningRocks, instance).get(rowIndex);
+      return grade === undefined ? original : family[grade];
+    } catch (_) { return original; }
+  },
+  scaleQuantity(instance, quantity) {
+    const multiplier = config.multipliers[instance.spawnState && instance.spawnState.nullsecEscalation ? 3 : prospectingTier(instance)];
+    if (!multiplier || multiplier === 1) return quantity;
+    const base = Number(quantity);
+    if (!Number.isFinite(base) || base <= 0) return quantity;
+    const scaled = Math.max(1, Math.round(base * multiplier));
+    const result = Math.min(scaled, Number.MAX_SAFE_INTEGER);
+    diagnostics.mark("oreScaling", Number.isSafeInteger(result) && result > 0, "Generated quantity arithmetic checked; live rock totals not checked");
+    return result;
+  },
+};
+// Called from the patched ore quantity line.
+globalThis.__nullsecUpgrades = internals;
+
+// Strict sizes: the bundled client content calls medium deposits simply "<ore> Deposit".
+// Match complete names, not substring ranks, so no wrong-size fallback is possible.
+function patchStrictProspectingSizes(source) {
+  const filterAnchor = '    .sort((left, right) => {\n      const leftName = normalizeLowerText(left && (left.resolvedName || left.name), "");';
+  const functionStart = source.indexOf('function listProspectingOreTemplates(mineral, tier) {');
+  const functionEnd = source.indexOf('\nfunction getStargateAdjacency()', functionStart);
+  if (functionStart < 0 || functionEnd < 0) throw new Error('Strict mining size: unsupported prospecting selector');
+  const section = source.slice(functionStart, functionEnd);
+  if (section.split(filterAnchor).length !== 2) throw new Error('Strict mining size: selector anchor mismatch');
+  const filter = `    .filter((template) => {
+      const name = normalizeLowerText(template && (template.resolvedName || template.name), "");
+      const level = toInt(tier, 0);
+      return oreNames.some((oreName) => {
+        const ore = normalizeLowerText(oreName, "");
+        if (level === 1) return name === "small " + ore + " deposit";
+        if (level === 2) return [ore + " deposit", "medium " + ore + " deposit", "average " + ore + " deposit"].includes(name);
+        if (level === 3) return name === "large " + ore + " deposit";
+        return false;
+      });
+    })
+`;
+  let patched = source.slice(0, functionStart) + section.replace(filterAnchor, filter + filterAnchor) + source.slice(functionEnd);
+
+  return patched;
+}
+
+// Use the native persistent lifecycle deadline and scheduler, not a new polling loop.
+internals.isStandardProspecting = instance => instance?.siteOrigin === "sov_hub" && isProspectingSite(instance);
+internals.respawnDelay = (instance, original) => {
+  if (!internals.isStandardProspecting(instance)) return original;
+  const tier = prospectingTier(instance);
+  return config.instantRespawn ? 0 : (config.respawnMinutes[tier] ?? RESPAWN_DEFAULTS[3]) * 60000;
+};
+
+// Natural system resources replace (never add to) physical local production.
+const naturalResourceCache = new WeakMap();
+const indexBenefits = require('./index-benefits').create(config,log,warn,diagnostics);
+internals.virtualResourcesEnabled = () => config.automaticPlanetaryResources === true;
+internals.boostResources = indexBenefits.boostResources;
+internals.getIndexPoints = indexBenefits.getIndexPoints;
+internals.naturalResources = (snapshot, systemID) => {
+  if (!snapshot || !snapshot.planetsBySolarSystemID?.has(systemID) || !snapshot.starConfigurationsBySolarSystemID?.has(systemID)) return null;
+  let cache = naturalResourceCache.get(snapshot);
+  if (!cache) { cache = new Map(); naturalResourceCache.set(snapshot, cache); }
+  if (cache.has(systemID)) return cache.get(systemID);
+  const star = snapshot.starConfigurationsBySolarSystemID.get(systemID);
+  let power = Number(star?.power) || 0, workforce = 0;
+  for (const id of new Set(snapshot.planetsBySolarSystemID.get(systemID))) {
+    const planet = snapshot.planetDefinitionsByPlanetID.get(id);
+    if (!planet) return null;
+    power += Number(planet.power) || 0;
+    workforce += Number(planet.workforce) || 0;
+  }
+  const result = Object.freeze({ power, workforce });
+  cache.set(systemID, result);
+  diagnostics.mark("planetaryResources",Number.isFinite(power)&&Number.isFinite(workforce)&&power>=0&&workforce>=0,"Natural resource totals calculated; native final accounting not independently checked");
+  log(`Automatic planetary resources: system ${systemID}, power ${power}, workforce ${workforce}.`);
+  return result;
+};
+function patchPlanetaryResources(source) {
+  const anchor = '  const harvested = stateCache.localHarvestBySolarSystemID.get(solarSystemID) || null;';
+  if (source.split(anchor).length !== 2) throw new Error("unsupported local harvest anchor");
+  source = source.replace(/\r\n/g, "\n");
+  const start = source.indexOf(anchor), end = source.indexOf('\n}', start);
+  if(end < 0) throw new Error('local harvest boundary unavailable');
+  const native = source.slice(start,end).replace('  return {','  const local = {');
+  return source.slice(0,start) + `  let virtual = null;
+  try { if(globalThis.__nullsecUpgrades.virtualResourcesEnabled()) virtual = globalThis.__nullsecUpgrades.naturalResources(stateCache.staticSnapshot, solarSystemID); } catch (_) {}
+${native}
+  return globalThis.__nullsecUpgrades.boostResources(solarSystemID, virtual || local);` + source.slice(end);
+}
+function validSource(source, filename) {
+  try { new (require("node:vm").Script)(Module.wrap(source), { filename }); return true; }
+  catch (error) { warn(`Transformation rejected for ${filename}: ${error.message}`); return false; }
+}
+
+// ---------------------------------------------------------------- 1. quantity
+const QUANTITY_PATTERN =
+  /const quantity = exactClientContent\s*\?\s*(Math\.max\(0, toFiniteNumber\(rawQuantity, 0\)\))\s*:\s*(Math\.max\(1, toInt\(rawQuantity, 1_000\)\));/g;
+const ORE_TYPE_PATTERN = /const oreTypeID = resolveMiningRockTypeID\(rock, instance\);/g;
+
+{
+  const originalCompile = Module.prototype._compile;
+  let mercoxitPending = true;
+  let strictPending = config.strictMiningSiteSize === true;
+  let orePending = true;
+  let resourcesPending = config.automaticPlanetaryResources === true || config.indexResources === true;
+  Module.prototype._compile = function patchedCompile(content, filename) {
+    if (resourcesPending && normalizedPath(filename).endsWith("/services/sovereignty/sovModernState.js")) {
+      resourcesPending = false;
+      try {
+        const candidate = patchPlanetaryResources(content);
+        if (validSource(candidate, filename)) { content = candidate; log("Automatic planetary resources hook installed."); }
+      } catch (error) { warn(`Automatic planetary resources skipped: ${error.message}`); }
+    }
+    if (mercoxitPending && normalizedPath(filename).endsWith("/services/dungeon/dungeonUniverseRuntime.js")) {
+      mercoxitPending=false;
+      try { const candidate=patchMercoxit(content.replace(/\r\n/g,"\n")); if(validSource(candidate,filename)){content=candidate;log("Mercoxit hook installed.");} } catch(e){warn(`Mercoxit hook skipped: ${e.message}`);}
+    }
+    if (strictPending && normalizedPath(filename).endsWith("/services/dungeon/dungeonUniverseRuntime.js")) {
+      try { const candidate = patchStrictProspectingSizes(content.replace(/\r\n/g, "\n")); if (validSource(candidate, filename)) { content = candidate; log("Strict mining site size active."); } } catch (error) { warn(`Strict size patch skipped: ${error.message}`); }
+      strictPending = false;
+    }
+    if (typeof filename === "string" &&
+        filename.replace(/\\/g, "/").endsWith("/services/dungeon/dungeonUniverseSiteService.js")) {
+      let patched = content;
+
+      if (config.anyMultiplier) {
+        let matches = 0;
+        const next = patched.replace(QUANTITY_PATTERN, (_whole, exact, normal) => {
+          matches += 1;
+          return "const quantity = globalThis.__nullsecUpgrades.scaleQuantity(instance, " +
+            `exactClientContent ? ${exact} : ${normal});`;
+        });
+        if (matches > 0) {
+          patched = next;
+          log(`Ore multipliers active: Array 1 x${config.multipliers[1]}, Array 2 x${config.multipliers[2]}, Array 3 x${config.multipliers[3]} (${matches} ore quantity site(s) patched).`);
+        } else {
+          warn("Could not find the ore quantity code in this EveJS version; the Prospecting Array multipliers are NOT active.");
+        }
+      } else {
+        log("All Prospecting Array multipliers are 1: ore volumes unchanged.");
+      }
+
+      if (config.tierMix) {
+        let tierMatches = 0;
+        const withTiers = patched.replace(ORE_TYPE_PATTERN, () => {
+          tierMatches += 1;
+          return "const oreTypeID = globalThis.__nullsecUpgrades.pickOreType(instance, populationHints, " +
+            "rockRowIndex, resolveMiningRockTypeID(rock, instance));";
+        });
+        if (tierMatches > 0) {
+          patched = withTiers;
+          log("Mining site tier distribution active for Prospecting Array sites: 50% tier IV, 30% tier III, 15% tier II, 5% tier I.");
+        } else {
+          warn("Could not find the ore type code in this EveJS version; Mining site tier distribution is NOT active.");
+        }
+      }
+
+      let appended = "";
+      if (config.tierMix) {
+        if (/\bresolveItemByTypeID\b/.test(patched)) appended += "\n;globalThis.__nullsecUpgrades.itemByTypeID = resolveItemByTypeID;";
+        else warn("Could not find the item lookup in this EveJS version; Mining site tier distribution will weigh rocks by quantity instead of m3.");
+      }
+      if (appended) patched += appended + "\n";
+      if (validSource(patched, filename)) content = patched;
+      orePending = false;
+    }
+    if (!strictPending && !orePending && !mercoxitPending && !resourcesPending && Module.prototype._compile === patchedCompile) Module.prototype._compile = originalCompile;
+    return originalCompile.call(this, content, filename);
+  };
+}
+
+// ------------------------------------------------------------------- 2. reset
+const SITE_STATES = ["seeded", "active", "paused", "completed", "failed", "despawned"];
+
+function resetProspectingSites(dungeonRuntime) {
+  const seen = new Set();
+  const ids = [];
+  for (const state of SITE_STATES) {
+    for (const instance of dungeonRuntime.listInstancesByLifecycle(state, { full: true })) {
+      const id = toInt(instance && instance.instanceID, 0);
+      if (id <= 0 || seen.has(id)) continue;
+      seen.add(id);
+      if (!(instance.runtimeFlags && instance.runtimeFlags.universeSeeded === true)) continue;
+      if (String(instance.siteOrigin || "").toLowerCase() !== "sov_hub") continue;
+      if (isProspectingSite(instance)) {
+        const runtime = require(path.join(EVEJS_ROOT, "server", "src", "space", "runtime"));
+        const scene = runtime.scenes?.get(instance.solarSystemID);
+        if (scene) {
+          const service = require(path.join(SERVER_SERVICES, "dungeon", "dungeonUniverseSiteService"));
+          const occupied = service.homefrontPorts?.occupied;
+          if (typeof occupied !== "function" || occupied(scene, instance, instance.metadata?.siteID || instance.spawnState?.siteID)) throw new Error(`Site ${id} occupied or occupancy unknown; reset postponed`);
+        }
+        ids.push(id);
+      }
+    }
+  }
+  const result = ids.length > 0
+    ? dungeonRuntime.purgeInstances(ids, { source: "nullsec-upgrades" })
+    : { removedCount: 0 };
+  const removed = toInt(result && result.removedCount, 0);
+  if (removed !== ids.length) throw new Error(`Reset incomplete: ${removed}/${ids.length} sites removed`);
+  return removed;
+}
+
+
+
+// ------------------------------------------------- highest ore grade
+// Fixed highest grade for every ore in the Interstitial Ore Deposit
+// (base type ID -> highest grade type ID). Nothing is looked up at runtime.
+const TOP_GRADE_BY_ORE = new Map([
+  [52316, 56628], // Bezdnacine   -> Bezdnacine Grade-III
+  [52315, 56630], // Rakovene     -> Rakovene Grade-III
+  [52306, 56626], // Talassonite  -> Talassonite Grade-III
+  [19, 46688],    // Spodumain    -> Spodumain Grade-IV
+  [11396, 17870], // Mercoxit     -> Mercoxit Grade-III
+]);
+
+function topGradeTypeID(typeID) {
+  const original = toInt(typeID, 0);
+  return TOP_GRADE_BY_ORE.get(original) || original;
+}
+
+function withTopGradeOre(populationHints) {
+  const hints = JSON.parse(JSON.stringify(populationHints || {}));
+  if (Array.isArray(hints.miningRocks)) {
+    for (const rock of hints.miningRocks) {
+      if (!rock) continue;
+      if (rock.typeID) rock.typeID = topGradeTypeID(rock.typeID);
+      if (rock.oreTypeID) rock.oreTypeID = topGradeTypeID(rock.oreTypeID);
+    }
+  }
+  return hints;
+}
+
+// ------------------------------------------------- telling the player(s)
+const FILETIME_EPOCH_OFFSET_MS = 11644473600000n;
+function msToFiletime(ms) { return ((BigInt(Math.trunc(ms)) + FILETIME_EPOCH_OFFSET_MS) * 10000n).toString(); }
+
+function sessionsInSystem(systemID) {
+  try {
+    const registry = require(path.join(getUniverseRuntime().__dir, "..", "chat", "sessionRegistry"));
+    return Array.from(registry.getSessions()).filter((session) => session &&
+      toInt(session.characterID || session.charid, 0) > 0 && resolveSessionSystemID(session) === systemID);
+  } catch (error) {
+    warn(`Could not list sessions in system ${systemID}: ${error.message}`);
+    return [];
+  }
+}
+
+function describeSite(created) {
+  let systemName = `system ${created.solarSystemID}`;
+  let siteName = "ore site";
+  try {
+    const worldData = require(path.join(getUniverseRuntime().__dir, "..", "..", "space", "worldData"));
+    const system = worldData.getSolarSystemByID(created.solarSystemID);
+    if (system && (system.solarSystemName || system.name)) systemName = system.solarSystemName || system.name;
+  } catch (_) { /* keep the id */ }
+  try {
+    const authority = require(path.join(getUniverseRuntime().__dir, "dungeonAuthority"));
+    const template = authority.getTemplateByIDReadOnly
+      ? authority.getTemplateByIDReadOnly(created.templateID) : authority.getTemplateByID(created.templateID);
+    if (template && (template.resolvedName || template.title)) siteName = template.resolvedName || template.title;
+  } catch (_) { /* keep the generic name */ }
+  return { systemName, siteName };
+}
+
+function notifyEscalation(created, recipients) {
+  if (!recipients.length) return;
+  let chatHub = null;
+  try { chatHub = require(path.join(getUniverseRuntime().__dir, "..", "chat", "chatHub")); } catch (_) { /* no chat */ }
+  if (!chatHub || typeof chatHub.sendSystemMessage !== "function") return;
+  const { systemName, siteName } = describeSite(created);
+  const message = `Mining escalation! ${siteName} has appeared in ${systemName}. ` +
+    `Expires ${new Date(Date.now()+ESCALATION_LIFETIME_MS).toISOString()}. Check your probe scanner or Journal.`;
+  for (const session of recipients) {
+    try { chatHub.sendSystemMessage(session, message); } catch (_) { /* never break the caller */ }
+  }
+}
+
+// Creates the escalation site and tells everyone in the system. `extraSession`
+// (the /miningescalation caller) is always told and always gets the entry.
+function spawnEscalation(parent, extraSession = null) {
+  const systemID = toInt(parent.solarSystemID, 0);
+  const recipients = sessionsInSystem(systemID);
+  if (extraSession && !recipients.includes(extraSession)) recipients.push(extraSession);
+  const characterIDs = [...new Set(recipients.map((session) => toInt(session.characterID || session.charid, 0)).filter((id) => id > 0))];
+  const built = buildEscalationSite(getDungeonRuntime(), getUniverseRuntime(), parent, Date.now(), characterIDs);
+  const created = createEscalationInstance(getUniverseRuntime(), built);
+  notifyEscalation(created, recipients);
+  return created;
+}
+
+// Rows for the Journal's escalating-path list (GetMyEscalatingPathDetails).
+function escalationRowsFor(session) {
+  const characterID = toInt(session && (session.characterID || session.charid), 0);
+  if (characterID <= 0) return [];
+  const dungeonRuntime = getDungeonRuntime();
+  const systemID = resolveSessionSystemID(session);
+  const now = Date.now();
+  const rows = [];
+  for (const state of ["seeded", "active", "paused"]) {
+    for (const instance of dungeonRuntime.listInstancesByLifecycle(state, { full: true })) {
+      if (!instance || String(instance.siteOrigin || "").toLowerCase() !== ESCALATION_ORIGIN) continue;
+      const expiresAtMs = toInt(instance.timers && instance.timers.expiresAtMs, 0);
+      if (expiresAtMs <= now) continue;
+      const info = (instance.spawnState && instance.spawnState.nullsecEscalation) || {};
+      const mine = Array.isArray(info.characterIDs) && info.characterIDs.includes(characterID);
+      if (!mine && toInt(instance.solarSystemID, 0) !== systemID) continue;
+      const dungeonID = toInt(info.clientDungeonID, 0) || ESCALATION_FALLBACK_DUNGEON_ID;
+      rows.push([
+        toInt(instance.instanceID, 0),
+        dungeonID,
+        dungeonID,
+        dungeonID,
+        { type: "long", value: msToFiletime(expiresAtMs) },
+        null,
+      ]);
+    }
+  }
+  return rows;
+}
+
+// ------------------------------------------------------------ 3. escalations
+// Mod-owned durable state. One atomic rename per transaction; no background polling.
+const STATE_PATH = path.join(path.dirname(CONFIG_PATH), "nullsec-upgrades-state.json");
+let durableState = null;
+let stateUnavailable = false;
+function loadState() {
+  if (durableState) return durableState;
+  if (stateUnavailable) throw new Error("mod state unavailable");
+  try {
+    const state = fs.existsSync(STATE_PATH) ? JSON.parse(fs.readFileSync(STATE_PATH, "utf8")) : { version: 1, cooldowns: {}, queue: {} };
+    if (state.version !== 1 || !state.cooldowns || Array.isArray(state.cooldowns) || !state.queue || typeof state.queue !== "object") throw new Error("unsupported state format");
+    if (Array.isArray(state.queue)) { const counts = {}; for (const row of state.queue) counts[row.systemID] = (counts[row.systemID] || 0) + 1; state.queue = counts; }
+    durableState = state;
+    return state;
+  } catch (error) { stateUnavailable = true; warn(`Persistent state disabled: ${error.message}`); throw error; }
+}
+function mutateState(fn) {
+  const next = JSON.parse(JSON.stringify(loadState()));
+  const result = fn(next);
+  fs.mkdirSync(path.dirname(STATE_PATH), { recursive: true });
+  const temp = `${STATE_PATH}.${process.pid}.tmp`;
+  let fd;
+  try {
+    fd = fs.openSync(temp, "w", 0o600);
+    fs.writeFileSync(fd, JSON.stringify(next)); fs.fsyncSync(fd); fs.closeSync(fd); fd = undefined;
+    fs.renameSync(temp, STATE_PATH);
+  } finally { if (fd !== undefined) fs.closeSync(fd); try { fs.unlinkSync(temp); } catch (_) {} }
+  durableState = next;
+  return result;
+}
+function upgradeKey(site) {
+  if (!isProspectingSite(site)) return null;
+  const hub = sovHubOf(site);
+  const system = Number(hub?.sourceSystemID || site.solarSystemID), type = Number(hub?.upgradeTypeID);
+  return system > 0 && type > 0 ? `${system}:${type}` : null;
+}
+// Mercoxit reserves are separate from standard Array cooldowns and escalation rolls.
+const deadlines = new Map();
+let deadlineTimer;
+function armDeadlines() {
+  if(deadlineTimer) clearTimeout(deadlineTimer);
+  deadlineTimer = undefined;
+  if(!deadlines.size) return;
+  let earliest=Infinity; for(const row of deadlines.values()) earliest=Math.min(earliest,row.at);
+  deadlineTimer=setTimeout(()=>{
+    const now=Date.now(), systems=new Set();
+    for(const [key,row] of deadlines) if(row.at<=now){deadlines.delete(key);systems.add(row.system);}
+    for(const system of systems) try { getUniverseRuntime().scheduleSystemUniversePersistentSitesReconcile(system,{reason:'nullsec-deadline',families:['sov_prospecting'],force:true,debounceMs:0}); } catch(e){warn(`Deadline reconcile failed: ${e.message}`);}
+    armDeadlines();
+  },Math.min(2147483647,Math.max(1,earliest-Date.now()))); deadlineTimer.unref();
+}
+function setDeadline(kind,key,at){const id=kind+':'+key;if(at>0) deadlines.set(id,{at,system:Number(key.split(':')[0])});else deadlines.delete(id);armDeadlines();}
+function mercoxitKey(hub) { return `${hub.sourceSystemID}:${hub.upgradeTypeID}`; }
+function isMercoxitSite(site) { return sovHubOf(site)?.nullsecMercoxit === true; }
+function mercoxitWake(key,deadline){setDeadline('mercoxit',key,config.mercoxit?deadline:0);}
+function mercoxitAdvance(row, now, active) {
+  const interval = config.mercoxitHours * 3600000;
+  const cap = config.mercoxitMax + (active ? 0 : 1);
+  row.ready = Math.min(row.ready, cap);
+  if (!interval) { row.ready = cap; row.deadline = 0; return; }
+  if (row.ready >= cap) { row.deadline = 0; return; }
+  if (!row.deadline) row.deadline = now + interval;
+  if (row.deadline <= now) {
+    const count = Math.min(cap-row.ready, 1+Math.floor((now-row.deadline)/interval));
+    row.ready += count; row.deadline += count*interval;
+    if (row.ready >= cap) row.deadline = 0;
+  }
+}
+function mercoxitPlan(hub, now, active) {
+  if (!config.mercoxit || !hub.upgradeTypeID) return null;
+  const key = mercoxitKey(hub);
+  const state = loadState();
+  let row = state.mercoxit?.[key];
+  if (!row) {
+    const used = new Set(Object.entries(state.mercoxit || {}).filter(([k])=>k.startsWith(`${hub.sourceSystemID}:`)).map(([,v])=>v.slot));
+    let slot=100; while (used.has(slot) && slot<500) slot++;
+    if (slot>=500) throw new Error('No free Mercoxit slot');
+    row={slot,ready:active?0:1,deadline:0,rotation:0,lastInstance:0};
+  }
+  const next={...row}; mercoxitAdvance(next,now,active);
+  if (!state.mercoxit?.[key] || JSON.stringify(next)!==JSON.stringify(row)) mutateState(s=>{ (s.mercoxit ||= {})[key]=next; });
+  mercoxitWake(key,next.deadline);
+  return active || next.ready>0 ? next : null;
+}
+internals.mercoxitEnabled = () => config.mercoxit === true;
+internals.mercoxitDefinition = (hub, now, build, template) => {
+  if (!config.mercoxit || !template || hub.upgradeTier!==3) return null;
+  try {
+    const marked={...hub,nullsecMercoxit:true};
+    const active=getDungeonRuntime().listInstancesBySystem(hub.sourceSystemID,{full:true}).find(s=>isMercoxitSite(s)&&mercoxitKey(sovHubOf(s))===mercoxitKey(hub)&&['active','seeded','paused'].includes(s.lifecycleState));
+    const row=mercoxitPlan(marked,now,!!active);
+    if (!row) return null;
+    return build(template,'sov_prospecting',hub.sourceSystemID,row.slot,now,marked,{rotationIndex:active ? Number(active.metadata?.rotationIndex||0) : row.rotation, label:'Enormous Mercoxit Deposit',tags:['prospecting','mercoxit'],siteLifetimeMinutes:525600});
+  } catch(e) { warn(`Mercoxit definition skipped: ${e.message}`); return null; }
+};
+function mercoxitChange(change,site) {
+  if (!config.mercoxit) return;
+  const key=mercoxitKey(sovHubOf(site)), now=Date.now();
+  if (change.changeType==='created') {
+    const row=loadState().mercoxit?.[key];
+    if (!row || row.lastInstance===site.instanceID) return;
+    mutateState(s=>{const r=s.mercoxit[key]; r.ready=Math.max(0,r.ready-1); r.lastInstance=site.instanceID; r.rotation=Number(site.metadata?.rotationIndex||0); mercoxitAdvance(r,now,true);});
+    mercoxitWake(key,loadState().mercoxit[key].deadline);
+    log(`Mercoxit spawned in ${site.solarSystemID}; reserves ${loadState().mercoxit[key].ready}.`);
+  } else if (change.changeType==='updated' && change.after?.lifecycleState==='completed' && change.before?.lifecycleState!=='completed' && change.after.lifecycleReason==='depleted') {
+    mutateState(s=>{const r=s.mercoxit?.[key]; if(!r)return; r.rotation++; mercoxitAdvance(r,now,false);});
+    requestDepletedTeardown(site);
+    mercoxitWake(key,now);
+  } else if (change.changeType==='removed') {
+    mercoxitWake(key,now);
+  }
+}
+function patchMercoxit(source) {
+  const a='    const definition = buildSovGuaranteedDefinition(\n      template,\n      "sov_prospecting",';
+  const b='  const spawnFamilyKey = normalizeLowerText(\n    instance && instance.metadata && instance.metadata.spawnFamilyKey,';
+  if(source.split(a).length!==2 || source.split(b).length!==2) throw new Error('Mercoxit native anchors unavailable');
+  source=source.replace(a,`    if (upgrade.tier === 3 && globalThis.__nullsecUpgrades.mercoxitEnabled()) {\n      const mercoxit = globalThis.__nullsecUpgrades.mercoxitDefinition(sovHub, nowMs, buildSovGuaranteedDefinition, dungeonAuthority.listTemplatesByFamily("ore").find(t => t.templateID === "client-dungeon:12986"));\n      if (mercoxit) definitions.push(mercoxit);\n    }\n`+a);
+  return source.replace(b,'  if (instance?.metadata?.sovHub?.nullsecMercoxit === true) return null;\n'+b);
+}
+
+function scheduleCooldown(key, deadline) { setDeadline('cooldown',key,deadline); }
+function recordCooldown(site, deadline) {
+  const key = upgradeKey(site);
+  if (!key) return;
+  mutateState(state => { state.cooldowns[key] = deadline; });
+  if (deadline > Date.now()) scheduleCooldown(key, deadline);
+}
+function activeEscalations(runtime, systemID) {
+  return runtime.listInstancesBySystem(systemID, { full: true }).filter(site => site.siteOrigin === ESCALATION_ORIGIN && ["active", "seeded", "paused"].includes(site.lifecycleState) && Number(site.timers?.expiresAtMs || Infinity) > Date.now());
+}
+function enqueueRoll(parent) {
+  const tier = parent.siteOrigin === ESCALATION_ORIGIN ? 3 : prospectingTier(parent);
+  const chance = Math.min(100, chanceForTier(tier) + indexBenefits.escalationBonus(parent.solarSystemID));
+  diagnostics.mark("indexEscalation", Number.isFinite(chance)&&chance>=0&&chance<=100,"Effective probability arithmetic checked");
+  const id = Number(parent.instanceID);
+  const runtime = getDungeonRuntime();
+  if (!config.escalations || !id || parent.spawnState?.nullsecEscalationRolled) return;
+  // Persist the decision with the queue before marking the parent. A queued parent ID is idempotent.
+  let roll;
+  mutateState(state => {
+    state.rolls ||= {};
+    if (Object.hasOwn(state.rolls, id)) { roll = state.rolls[id]; return; }
+    roll = Math.random() * 100;
+    state.rolls[id] = roll;
+    if (roll < chance) state.queue[parent.solarSystemID] = (state.queue[parent.solarSystemID] || 0) + 1;
+  });
+  runtime.mergeSpawnState(id, { nullsecEscalationRolled: true, nullsecEscalationRolledAtMs: Date.now() }, { durable: true });
+  mutateState(state => { delete state.rolls[id]; });
+  diagnostics.mark("escalations", Number.isFinite(roll)&&roll>=0&&roll<100,"Depletion roll persisted and parent marked");
+  log(`Site ${id} depleted: escalation roll ${roll.toFixed(2)} / ${chance}%.`);
+}
+const pendingDrains = new Set();
+function requestDrain(systemID) {
+  if (!config.escalations || !systemID || pendingDrains.has(systemID)) return;
+  pendingDrains.add(systemID);
+  setImmediate(() => {
+    pendingDrains.delete(systemID);
+    try {
+      const runtime = getDungeonRuntime();
+      while (activeEscalations(runtime, systemID).length < 2) {
+        if (!(loadState().queue[systemID] > 0)) break;
+        // Reserve before spawning; restore on synchronous failure. No queued site data.
+        mutateState(state => { if (--state.queue[systemID] === 0) delete state.queue[systemID]; });
+        try {
+          const created = spawnEscalation({ instanceID: 0, solarSystemID: systemID, siteOrigin: 'sov_hub', spawnState: { sovHub: { upgradeCategory: 'prospecting', upgradeTier: 3 } } });
+          if (!created?.instanceID) throw new Error('escalation creation returned no instance');
+          log(`Queued escalation spawned as ${created.instanceID}.`);
+        } catch(error) { mutateState(state => { state.queue[systemID] = (state.queue[systemID] || 0) + 1; }); throw error; }
+      }
+    } catch (error) { warn(`Escalation queue drain failed: ${error.message}`); }
+  });
+}
+function recoverPersistentWork() {
+  try {
+    const state = loadState();
+    for (const [key, deadline] of Object.entries(state.cooldowns)) scheduleCooldown(key, Number(deadline));
+    if (config.escalations) for (const id of Object.keys(state.rolls || {})) {
+      const parent = getDungeonRuntime().getInstance(Number(id));
+      if (parent?.lifecycleState === "completed" && !parent.spawnState?.nullsecEscalationRolled) enqueueRoll(parent);
+      else mutateState(next => { delete next.rolls[id]; });
+    }
+    if (config.escalations) for (const system of Object.keys(state.queue).map(Number)) requestDrain(system);
+  } catch (error) { warn(`Persistent recovery skipped: ${error.message}`); }
+}
+
+
+function chanceForTier(tier) {
+  return config.chances[tier] || 0;
+}
+
+// The site-ID and placement helpers are only exported under _testing.
+function universeHelpers(universeRuntime) {
+  return (universeRuntime && universeRuntime._testing &&
+    typeof universeRuntime._testing.buildUniverseSiteID === "function") ? universeRuntime._testing : universeRuntime;
+}
+
+// Identity the client needs to name the site "Interstitial Ore Deposit". The
+// rocks come from the reference ore template; the name comes from the client's
+// own dungeon record (falling back to the values read from the static data).
+function resolveEscalationIdentity(universeRuntime) {
+  const authority = require(path.join(universeRuntime.__dir, "dungeonAuthority"));
+  const read = authority.getTemplateByIDReadOnly || authority.getTemplateByID;
+  const reference = read.call(authority, ESCALATION_TEMPLATE_ID);
+  if (!reference) {
+    throw new Error(`template ${ESCALATION_TEMPLATE_ID} not found (is the ore anomalies content pack installed?)`);
+  }
+  if (!reference.populationHints || !Array.isArray(reference.populationHints.miningRocks) ||
+      reference.populationHints.miningRocks.length === 0) {
+    throw new Error("the Interstitial Ore Deposit template has no ore rocks");
+  }
+  let client = null;
+  try { client = read.call(authority, ESCALATION_CLIENT_TEMPLATE_ID); } catch (_) { /* optional */ }
+  if (client && String(client.resolvedName || "").toLowerCase() !== "interstitial ore deposit") client = null;
+  return {
+    reference,
+    dungeonNameID: toInt(client && client.dungeonNameID, 0) || ESCALATION_FALLBACK_NAME_ID,
+    clientDungeonID: toInt(client && client.sourceDungeonID, 0) || ESCALATION_FALLBACK_DUNGEON_ID,
+  };
+}
+
+function buildEscalationSite(dungeonRuntime, universeRuntime, parent, now, characterIDs = []) {
+  const adapter = require(path.join(universeRuntime.__dir, "dungeonSiteAdapter"));
+  const identity = resolveEscalationIdentity(universeRuntime);
+  const template = identity.reference;
+  const systemID = toInt(parent.solarSystemID, 0);
+  const used = new Set();
+  for (const instance of dungeonRuntime.listInstancesBySystem(systemID, { full: true })) {
+    const siteID = toInt(instance && instance.metadata && instance.metadata.siteID, 0);
+    if (siteID > 0 && instance.metadata && instance.metadata.nullsecEscalation === true) used.add(siteID);
+  }
+  let slot = -1;
+  let siteID = 0;
+  for (let candidate = ESCALATION_SLOT_FIRST; candidate <= ESCALATION_SLOT_LAST; candidate += 1) {
+    const id = universeHelpers(universeRuntime).buildUniverseSiteID("sov_prospecting", systemID, candidate);
+    if (id > 0 && !used.has(id)) { slot = candidate; siteID = id; break; }
+  }
+  if (slot < 0) throw new Error("no free escalation slot in this system");
+
+  const placement = universeHelpers(universeRuntime).buildUniverseSitePlacement(systemID, "sov_prospecting", slot, 0);
+  const providerID = "sceneAnomalySite";
+  const clone = (value) => JSON.parse(JSON.stringify(value === undefined ? null : value));
+  const label = String(template.resolvedName || template.title || "Interstitial Ore Deposit");
+  const anchor = {
+    anchorItemID: toInt(placement && placement.anchorItemID, 0) || null,
+    anchorDistanceMeters: Math.round(Number(placement && placement.anchorDistanceMeters) || 0),
+    anchorDistanceAu: Number((Number(placement && placement.anchorDistanceAu) || 0).toFixed(3)),
+  };
+  const spawnState = {
+    siteID,
+    slotIndex: slot,
+    rotationIndex: 0,
+    spawnFamilyKey: ESCALATION_FAMILY,
+    label,
+    lifetimeMs: ESCALATION_LIFETIME_MS,
+    populationHints: withTopGradeOre(template.populationHints),
+    ...anchor,
+    nullsecEscalation: {
+      tier: prospectingTier(parent) || 3,
+      parentInstanceID: toInt(parent.instanceID, 0),
+      clientDungeonID: identity.clientDungeonID,
+      characterIDs,
+      createdAtMs: now,
+    },
+  };
+  const metadata = {
+    providerID,
+    siteID,
+    slotIndex: slot,
+    rotationIndex: 0,
+    spawnFamilyKey: ESCALATION_FAMILY,
+    label,
+    universeSeededAtMs: now,
+    ...anchor,
+    nullsecEscalation: true,
+  };
+  return {
+    options: {
+      templateID: template.templateID,
+      solarSystemID: systemID,
+      siteKey: adapter.buildSiteKey(providerID, systemID, siteID),
+      lifecycleState: "active",
+      instanceScope: "shared",
+      siteFamily: template.siteFamily || "ore",
+      siteKind: template.siteKind || "anomaly",
+      siteOrigin: ESCALATION_ORIGIN,
+      position: placement.position,
+      nowMs: now,
+      activatedAtMs: now,
+      expiresAtMs: now + ESCALATION_LIFETIME_MS,
+      roomStatesByKey: {
+        "room:entry": {
+          roomKey: "room:entry", state: "active", stage: "entry", pocketID: null, nodeGraphID: null,
+          activatedAtMs: now, completedAtMs: 0, lastUpdatedAtMs: now, spawnedEntityIDs: [], counters: {},
+          metadata: { lightweight: true },
+        },
+      },
+      gateStatesByKey: {},
+      objectiveState: {
+        state: "pending", currentNodeID: null, currentObjectiveID: null,
+        completedObjectiveIDs: [], completedNodeIDs: [], counters: {}, metadata: { lightweight: true },
+      },
+      environmentState: { seededAtMs: now, templateRef: template.templateID, lightweight: true },
+      spawnState,
+      runtimeFlags: { universeSeeded: true, universePersistent: true, lazyMaterialized: true, nullsecEscalation: true },
+      metadata,
+      durable: true,
+    },
+    dungeonNameID: identity.dungeonNameID,
+  };
+}
+
+// The server copies a site's identity from its template when it creates the
+// instance. For this one call the template is handed over with the client's
+// Interstitial Ore Deposit name ID, so the site is stored with its proper name.
+function createEscalationInstance(universeRuntime, built) {
+  const authority = require(path.join(universeRuntime.__dir, "dungeonAuthority"));
+  const originals = {};
+  for (const key of ["getTemplateByID", "getTemplateByIDReadOnly"]) {
+    originals[key] = authority[key];
+    if (typeof originals[key] !== "function") continue;
+    authority[key] = function derivedTemplateLookup(...args) {
+      const template = originals[key].apply(this, args);
+      return template && template.templateID === ESCALATION_TEMPLATE_ID
+        ? { ...template, dungeonNameID: built.dungeonNameID }
+        : template;
+    };
+  }
+  try {
+    return getDungeonRuntime().createInstance(built.options);
+  } finally {
+    for (const key of Object.keys(originals)) if (typeof originals[key] === "function") authority[key] = originals[key];
+  }
+}
+
+// Native scoped teardown port: run after the original listeners have parked a completed grid.
+// This does not bypass occupancy for unrelated sites or for administrative startup reset.
+const pendingTeardowns = new Set();
+function requestDepletedTeardown(instance) {
+  if (pendingTeardowns.has(instance.instanceID)) return;
+  pendingTeardowns.add(instance.instanceID);
+  setImmediate(() => {
+    try {
+      const current = getDungeonRuntime().getInstance(instance.instanceID);
+      if (!current || current.lifecycleState !== "completed" || current.lifecycleReason !== "depleted" || (!isProspectingSite(current) && !isMercoxitSite(current) && current.siteOrigin !== ESCALATION_ORIGIN)) return;
+      const siteID = Number(current.metadata?.siteID || current.spawnState?.siteID);
+      if (!(siteID > 0)) return;
+      const runtime = require(path.join(EVEJS_ROOT, "server", "src", "space", "runtime"));
+      const scene = runtime.scenes?.get(current.solarSystemID);
+      if (!scene) return;
+      const service = require(path.join(SERVER_SERVICES, "dungeon", "dungeonUniverseSiteService"));
+      if (!service.isUniverseSiteTeardownParked?.(current.solarSystemID, current.instanceID)) return;
+      const flush = service._testing?.flushPendingSiteTeardownsForSite;
+      if (typeof flush !== "function") { warn("Native scoped teardown port unavailable; retaining occupancy grace."); return; }
+      flush(scene, siteID, { broadcast: true });
+      const scheduler = require(path.join(SERVER_SERVICES, "dungeon", "globalSiteSchedulerRuntime"));
+      if (typeof scheduler.queueDurableGlobalSiteReconciliation === "function") Promise.resolve(scheduler.queueDurableGlobalSiteReconciliation({ scanExisting: false, systemIDs: [current.solarSystemID] })).catch(error => warn(`Teardown reconcile: ${error.message}`));
+      log(`Depleted site ${current.instanceID} grid teardown completed.`);
+    } catch (error) { warn(`Depleted site teardown skipped: ${error.message}`); } finally { pendingTeardowns.delete(instance.instanceID); }
+  });
+}
+
+function makeInstanceListener(dungeonRuntime, getUniverseRuntime) {
+  return function onInstanceChange(change) {
+    try {
+      const instance = change?.after || change?.before;
+      if (!instance) return;
+      if (isMercoxitSite(instance)) { mercoxitChange(change,instance); return; }
+      const isEsc = instance.siteOrigin === ESCALATION_ORIGIN;
+      const isSov = isProspectingSite(instance);
+      if (!isEsc && !isSov) return;
+      if (change.changeType === "created" && isSov) {
+        const key = upgradeKey(instance);
+        if (key && Object.hasOwn(loadState().cooldowns, key) && Number(loadState().cooldowns[key]) <= Date.now()) mutateState(state => { delete state.cooldowns[key]; });
+        diagnostics.mark("respawn",null,"Native site creation observed; deadline comparison not independently verified");
+        log(`Array ${prospectingTier(instance)} site ${instance.instanceID} spawned in ${instance.solarSystemID}.`);
+      }
+      if (isEsc && (change.changeType === "removed" || (change.after && !["active", "paused", "seeded"].includes(change.after.lifecycleState)))) requestDrain(instance.solarSystemID);
+      // Native completion verifies all authored rock identities and quantities.
+      if (change.changeType !== "updated" || change.after?.lifecycleState !== "completed" || change.after.lifecycleReason !== "depleted" || change.before?.lifecycleState === "completed") return;
+      if (isSov) {
+        const deadline = Number(change.after.timers?.completedAtMs || Date.now()) + internals.respawnDelay(change.after, 0);
+        recordCooldown(change.after, deadline);
+      }
+      requestDepletedTeardown(change.after);
+      if (config.escalations) {
+        enqueueRoll(change.after);
+        requestDrain(instance.solarSystemID);
+      }
+    } catch (error) { warn(`Mining lifecycle listener: ${error.message}`); }
+  };
+}
+
+
+// --------------------------------------------------------- 4. debug command
+const DEBUG_COMMAND = "miningescalation";
+
+function resolveSessionSystemID(session) {
+  return toInt(
+    (session && session._space && session._space.systemID) ||
+    (session && session.solarsystemid2) || (session && session.solarsystemid), 0);
+}
+
+// What the forced escalation counts as coming from: a Prospecting Array site in
+// the caller's system (Array 3 preferred) or, if there is none, a stand-in Array 3.
+function pickDebugParent(dungeonRuntime, systemID) {
+  let best = null;
+  for (const instance of dungeonRuntime.listInstancesBySystem(systemID, { full: true })) {
+    if (String(instance.siteOrigin || "").toLowerCase() !== "sov_hub" || !isProspectingSite(instance)) continue;
+    if (!best || prospectingTier(instance) > prospectingTier(best)) best = instance;
+  }
+  if (best) return { parent: best, source: `Prospecting Array ${prospectingTier(best) || "?"} site ${best.instanceID}` };
+  return {
+    parent: {
+      instanceID: 0,
+      solarSystemID: systemID,
+      spawnState: { sovHub: { upgradeCategory: "prospecting", upgradeTier: 3 } },
+      metadata: {},
+    },
+    source: "a stand-in Prospecting Array 3 (none in this system)",
+  };
+}
+
+function forceEscalation(session) {
+  let dungeonRuntime;
+  let universeRuntime;
+  try {
+    dungeonRuntime = getDungeonRuntime();
+    universeRuntime = getUniverseRuntime();
+  } catch (error) {
+    throw new Error(`could not reach the dungeon runtime (${error.message})`);
+  }
+  if (!dungeonRuntime || !universeRuntime) throw new Error("dungeon runtime is not available");
+  const systemID = resolveSessionSystemID(session);
+  if (systemID <= 0) throw new Error("you must be in a solar system (undock first)");
+  const { parent, source } = pickDebugParent(dungeonRuntime, systemID);
+  const created = spawnEscalation(parent, session);
+  log(`Debug escalation forced in system ${systemID} (as if from ${source}) as site ${created && created.instanceID}.`);
+  return `Mining escalation forced in this system: Interstitial Ore Deposit, site ${created && created.instanceID} ` +
+    `(as if from ${source}), open for 24 hours. Check your probe scanner / anomaly list.`;
+}
+
+
+// ------------------------------------------------ /nukeminingsites
+const NUKE_COMMAND = "nukeminingsites";
+const NUKE_FAMILIES = new Set(["ore", "ice", "gas"]);
+const NUKE_CHUNK_SIZE = 20;
+
+// Mining sites: ore, ice and gas sites the game spawns by itself (generated belts,
+// universe anomalies, Prospecting Array sites) and mining escalation sites.
+// Escalation sites are removed but not respawned: they only come from mining.
+function listNukeableMiningSites(dungeonRuntime, systemID) {
+  const byID = new Map();
+  for (const state of SITE_STATES) {
+    for (const instance of dungeonRuntime.listInstancesByLifecycle(state, { full: true })) {
+      const id = toInt(instance && instance.instanceID, 0);
+      const system = toInt(instance && instance.solarSystemID, 0);
+      if (id <= 0 || system <= 0 || (systemID && system !== systemID)) continue;
+      if (!(instance.runtimeFlags && instance.runtimeFlags.universeSeeded === true)) continue;
+      if (!isProspectingSite(instance) && instance.siteOrigin !== ESCALATION_ORIGIN) continue;
+      byID.set(id, system);
+    }
+  }
+  return byID;
+}
+
+function respawnSystem(universeRuntime, systemID) {
+  const result = universeRuntime.prepareSystemForPlayerEntry(systemID, { force: true, reason: "nukeminingsites" });
+  if (!result || result.success === false) {
+    throw new Error(`respawn failed in system ${systemID}: ${result && result.errorMsg || "unknown error"}`);
+  }
+  const summary = result.reconcile && result.reconcile.summary;
+  return Math.max(0, toInt(summary && summary.createdInstances, 0));
+}
+
+function tellSession(session, message) {
+  try {
+    const chatHub = require(path.join(SERVER_SERVICES, "chat", "chatHub"));
+    chatHub.sendSystemMessage(session, message);
+  } catch (_) { /* the log line still has it */ }
+}
+
+function clearCooldownsFor(systemID) {
+  mutateState(state => {
+    for (const key of Object.keys(state.cooldowns)) if (!systemID || key.startsWith(`${systemID}:`)) delete state.cooldowns[key];
+  });
+  for (const [key,row] of deadlines) if (key.startsWith("cooldown:") && (!systemID || row.system === Number(systemID))) deadlines.delete(key); armDeadlines();
+}
+function nukeMiningSites(session, scope) {
+  const dungeonRuntime = getDungeonRuntime();
+  const universeRuntime = getUniverseRuntime();
+  if (scope === "local") {
+    const systemID = resolveSessionSystemID(session);
+    if (systemID <= 0) throw new Error("you must be in a solar system (undock first)");
+    const sites = listNukeableMiningSites(dungeonRuntime, systemID);
+    clearCooldownsFor(systemID);
+    const removed = sites.size > 0 ? toInt(dungeonRuntime.purgeInstances([...sites.keys()], { source: "nukeminingsites" }).removedCount, 0) : 0;
+    const created = respawnSystem(universeRuntime, systemID);
+    log(`/${NUKE_COMMAND} local: system ${systemID}, removed ${removed}, respawned ${created}.`);
+    return `Nuked sovereignty mining sites and mining escalations in this system: removed ${removed}, ${created} respawned.`;
+  }
+
+  const sites = listNukeableMiningSites(dungeonRuntime, 0);
+  clearCooldownsFor(0);
+  const systemIDs = [...new Set(sites.values())].sort((a, b) => a - b);
+  const removed = sites.size > 0 ? toInt(dungeonRuntime.purgeInstances([...sites.keys()], { source: "nukeminingsites" }).removedCount, 0) : 0;
+  log(`/${NUKE_COMMAND} all: removed ${removed} mining sites in ${systemIDs.length} systems; respawning in the background.`);
+  // Respawn a few systems per tick so the server keeps answering players.
+  let index = 0;
+  let created = 0;
+  let failed = 0;
+  const step = () => {
+    const end = Math.min(index + NUKE_CHUNK_SIZE, systemIDs.length);
+    for (; index < end; index += 1) {
+      try { created += respawnSystem(universeRuntime, systemIDs[index]); } catch (error) {
+        failed += 1;
+        warn(error.message);
+      }
+    }
+    if (index < systemIDs.length) { setImmediate(step); return; }
+    const done = `Nuke finished: removed ${removed} mining sites, ${created} respawned across ${systemIDs.length} systems` +
+      `${failed ? ` (${failed} systems failed, see the server console)` : ""}.`;
+    log(done);
+    tellSession(session, done);
+  };
+  setImmediate(step);
+  return `Nuking ${removed} mining sites across ${systemIDs.length} systems. Respawning in the background; ` +
+    "you will get a message when it is done.";
+}
+
+function tryHandleDebugCommand(commandsDir, session, rawMessage, chatHub, options) {
+  const text = String(rawMessage || "").trim();
+  if (!text.startsWith("/")) return null;
+  const parts = text.slice(1).trim().split(/\s+/);
+  const name = (parts[0] || "").toLowerCase();
+  if(name === "nullsecindexsnapshot") {
+    const {hasStaffDebugRole}=require(path.join(commandsDir,"commandAccess"));
+    if(!verbose || !hasStaffDebugRole(session)) return {handled:true,returnValue:JSON.stringify({available:false,authorized:false})};
+    try {return {handled:true,returnValue:JSON.stringify({...industrialIndex.snapshot(resolveSessionSystemID(session)),authorized:true})};}
+    catch (_) {return {handled:true,returnValue:JSON.stringify({available:false,authorized:true})};}
+  }
+  if (!config.commands) return null;
+  if (name !== DEBUG_COMMAND && name !== NUKE_COMMAND && !["nullsecstatus","nullsecdebug","nullsecvalidate","nullsecqueue"].includes(name)) return null;
+  const { handledResult } = require(path.join(commandsDir, "commandReplies"));
+  const { hasStaffDebugRole } = require(path.join(commandsDir, "commandAccess"));
+  const reply = (message) => handledResult(chatHub, session, options, message);
+  if (!hasStaffDebugRole(session)) return reply(`/${name} requires a staff/admin role.`);
+  try {
+    diagnostics.mark("commands",true,"Staff command dispatch verified");
+    if (name === "nullsecstatus") return reply(diagnostics.report());
+    if (name.startsWith("nullsec")) {
+      const id=resolveSessionSystemID(session);
+      if(!id) return reply("No current solar system.");
+      const state=loadState(), runtime=getDungeonRuntime();
+      const sites=runtime.listInstancesBySystem(id,{full:true});
+      const queue=state.queue[id]??0;
+      const mercoxit=Object.entries(state.mercoxit||{}).filter(([k])=>k.startsWith(id+":"));
+      const cooldowns=Object.entries(state.cooldowns).filter(([k])=>k.startsWith(id+":"));
+      const active=activeEscalations(runtime,id).length;
+      const queueOK=Number.isSafeInteger(queue)&&queue>=0&&mercoxit.every(([,r])=>Number.isSafeInteger(r.ready)&&r.ready>=0&&r.ready<=config.mercoxitMax+1&&Number.isFinite(r.deadline))&&cooldowns.every(([,v])=>Number.isFinite(v)&&v>=0);
+      const lines=[`System ${id}; active escalations ${active}; queued ${queue}`,`Mercoxit: ${JSON.stringify(mercoxit)}`,`Cooldown deadlines (epoch ms): ${JSON.stringify(cooldowns)}`,`Queue integrity: ${queueOK?"PASS":"FAIL"}; active limit may be exceeded by staff commands`];
+      if(name!=="nullsecqueue") {const points=indexBenefits.getIndexPoints(id), bonus=indexBenefits.escalationBonus(id);lines.push(`Live index points ${points}; cached escalation bonus ${bonus}; effective chances ${[1,2,3].map(t=>Math.min(100,chanceForTier(t)+bonus)).join(" / ")}%`, `Industrial journal: ${JSON.stringify(state.industrialIndex?.[id]||null)}`,`Owned sites: ${sites.filter(s=>isProspectingSite(s)||isMercoxitSite(s)).map(s=>s.instanceID+":"+s.lifecycleState).join(", ")}`);}
+      if(name==="nullsecvalidate") lines.push(diagnostics.report(),"Read-only snapshot; pending checks require gameplay evidence.");
+      return reply(lines.join("\n"));
+    }
+    if (name === DEBUG_COMMAND) return reply(forceEscalation(session));
+    const scope = (parts[1] || "").toLowerCase();
+    if (scope !== "local" && scope !== "all") {
+      return reply(`Usage: /${NUKE_COMMAND} local (this system only) or /${NUKE_COMMAND} all (the whole universe).`);
+    }
+    return reply(nukeMiningSites(session, scope));
+  } catch (error) {
+    warn(`/${name} failed: ${error && error.message || error}`);
+    return reply(`/${name} failed: ${error && error.message || error}`);
+  }
+}
+
+// -------------------------------------------------------------- module hooks
+let dungeonRuntimeModule = null;
+let universeRuntimeModule = null;
+let resetHooked = false;
+let listenerHooked = false;
+let commandsHooked = false;
+let explorationHooked = false;
+
+const SERVER_SERVICES = path.join(EVEJS_ROOT, "server", "src", "services");
+
+function normalizedPath(filename) { return String(filename || "").replace(/\\/g, "/"); }
+
+// The runtimes are used by the command and the notices, so they are fetched on
+// demand if the hook has not seen them load (for example because the server
+// had already loaded them before this loader ran).
+function getDungeonRuntime() {
+  if (!dungeonRuntimeModule) hookLoadedModule(require(path.join(SERVER_SERVICES, "dungeon", "dungeonRuntime.js")),
+    path.join(SERVER_SERVICES, "dungeon", "dungeonRuntime.js"));
+  return dungeonRuntimeModule;
+}
+
+function getUniverseRuntime() {
+  if (!universeRuntimeModule) hookLoadedModule(require(path.join(SERVER_SERVICES, "dungeon", "dungeonUniverseRuntime.js")),
+    path.join(SERVER_SERVICES, "dungeon", "dungeonUniverseRuntime.js"));
+  return universeRuntimeModule;
+}
+
+// Applies whichever of our hooks belong to this module. Safe to call twice.
+const industrialIndex = require("./industrial-index").create({config,loadState,mutateState,log,warn,diagnostics});
+function hookLoadedModule(exported, filenameRaw) {
+  const filename = normalizedPath(filenameRaw);
+  if (!exported) return;
+  indexBenefits.attach(exported, filename);
+  industrialIndex.attach(exported, filename);
+
+  // The Journal's escalating-path list: a service class, not a plain object.
+  if (!explorationHooked && typeof exported === "function" && exported.prototype &&
+      typeof exported.prototype.Handle_GetMyEscalatingPathDetails === "function" &&
+      filename.endsWith("/services/dungeon/dungeonExplorationMgrService.js")) {
+    explorationHooked = true;
+    const serviceDir = path.dirname(filenameRaw);
+    const original = exported.prototype.Handle_GetMyEscalatingPathDetails;
+    exported.prototype.Handle_GetMyEscalatingPathDetails = function withMiningEscalations(args, session, kwargs) {
+      try {
+        const rows = escalationRowsFor(session);
+        if (rows.length > 0) {
+          const { buildRowset } = require(path.join(serviceDir, "..", "_shared", "serviceHelpers"));
+          const { buildCachedMethodCallResult } = require(path.join(serviceDir, "..", "cache", "objectCacheRuntime"));
+          return buildCachedMethodCallResult(
+            buildRowset(["instanceID", "dungeon", "destDungeon", "srcDungeon", "expiryTime", "journalEntryTemplateID"],
+              rows, "eve.common.script.sys.rowset.Rowset"),
+            { serviceName: this.name, method: "GetMyEscalatingPathDetails", versionCheck: "always" });
+        }
+      } catch (error) {
+        warn(`Could not add mining escalations to the escalating path list: ${error && error.message || error}`);
+      }
+      return original.apply(this, arguments);
+    };
+    return;
+  }
+
+  if (typeof exported !== "object") return;
+
+  if (!dungeonRuntimeModule && typeof exported.purgeInstances === "function" &&
+      typeof exported.createInstance === "function" &&
+      typeof exported.registerInstanceChangeListener === "function" &&
+      filename.endsWith("/services/dungeon/dungeonRuntime.js")) {
+    dungeonRuntimeModule = exported;
+    if (typeof exported.rotateUniversePersistentInstances === "function") {
+      const rotate = exported.rotateUniversePersistentInstances;
+      exported.rotateUniversePersistentInstances = function nullsecRotate(rotations, options = {}) {
+        if (!Array.isArray(rotations)) return rotate.apply(this, arguments);
+        const now = Number(options.nowMs ?? Date.now());
+        const delayed = [], ready = [];
+        for (const row of rotations) {
+          const site = row.existingInstance, key = upgradeKey(site);
+          if (key && site.lifecycleReason === "depleted" && Number(loadState().cooldowns[key]) > now) delayed.push(site.instanceID);
+          else ready.push(row);
+        }
+        const retired = delayed.length ? exported.purgeInstances(delayed, {source:"nullsec-cooldown"}) : null;
+        const result = rotate.call(this, ready, options);
+        return retired ? {...result, removedCount: Number(result.removedCount||0)+Number(retired.removedCount||0)} : result;
+      };
+      log("Sovereignty depletion lifecycle hook installed.");
+    }
+    if (typeof exported.reconcileUniverseSeededInstances === "function") {
+      const reconcile = exported.reconcileUniverseSeededInstances;
+      exported.reconcileUniverseSeededInstances = function nullsecReconcile(definitions, options = {}) {
+        if (!Array.isArray(definitions)) return reconcile.apply(this, arguments);
+        let filtered = definitions, adjusted = options;
+        try {
+          const state = loadState(), now = Number(options.nowMs ?? Date.now());
+          const preserve = new Set(options.preserveSiteKeys || []);
+          const systems = new Set(options.systemIDs || definitions.map(site => site.solarSystemID));
+          // No global scan: inspect only systems in the requested native reconcile.
+          for (const system of systems) for (const site of exported.listInstancesBySystem(system)) {
+            if (site.siteOrigin === ESCALATION_ORIGIN) preserve.add(site.siteKey);
+            const key = upgradeKey(site);
+            if (config.strictMiningSiteSize && key && ["active", "seeded", "paused"].includes(site.lifecycleState)) {
+              const desired = definitions.find(def => def.siteKey === site.siteKey && upgradeKey(def) === key);
+              if (desired && Number(sovHubOf(desired)?.sourceHubID) === Number(sovHubOf(site)?.sourceHubID) && Number(desired.metadata?.rotationIndex || 0) === Number(site.metadata?.rotationIndex || 0)) preserve.add(site.siteKey);
+            }
+          }
+          filtered = definitions.filter(site => {
+            const key = upgradeKey(site);
+            if (!key || !(Number(state.cooldowns[key]) > now)) return true;
+            return false;
+          });
+          adjusted = { ...options, preserveSiteKeys: [...preserve] };
+        } catch (error) { warn(`Cooldown reconciliation skipped: ${error.message}`); }
+        return reconcile.call(this, filtered, adjusted);
+      };
+      log("Sovereignty cooldown reconciliation hook installed.");
+    }
+    if (!listenerHooked) {
+      listenerHooked = true;
+      exported.registerInstanceChangeListener(makeInstanceListener(exported, () => universeRuntimeModule || getUniverseRuntime()));
+      log("Sovereignty lifecycle listener installed.");
+    }
+  }
+
+  if (!universeRuntimeModule && typeof exported.resetStartupOrphanedUniverseSites === "function" &&
+      filename.endsWith("/services/dungeon/dungeonUniverseRuntime.js")) {
+    universeRuntimeModule = exported;
+    Object.defineProperty(exported, "__dir", { value: path.dirname(filenameRaw), enumerable: false });
+    if (!resetHooked) {
+      resetHooked = true;
+      const originalSweep = exported.resetStartupOrphanedUniverseSites;
+      exported.resetStartupOrphanedUniverseSites = function sweepWithProspectingReset(...args) {
+        let resetOK = false;
+        if (config.reset) {
+          try {
+            const removed = resetProspectingSites(getDungeonRuntime());
+            mutateState(state => { state.cooldowns = {}; });
+            for (const key of deadlines.keys()) if(key.startsWith("cooldown:")) deadlines.delete(key); armDeadlines();
+            resetOK = true;
+            diagnostics.mark("reset",true,"Reset removal and cooldown clearing completed");
+            log(`Reset mining sites: removed ${removed} Prospecting Array sites.`);
+          } catch (error) { diagnostics.mark("reset",false,"Reset failed"); warn(`Reset incomplete: ${error.message}`); }
+        }
+        const finish = value => { if (resetOK) clearResetSwitch(); recoverPersistentWork(); return value; };
+        const result = originalSweep.apply(this, args);
+        return result && typeof result.then === "function" ? result.then(finish) : finish(result);
+      };
+    }
+  }
+
+  if ((config.commands || verbose) && !commandsHooked && typeof exported.executeChatCommand === "function" &&
+      typeof exported.executeClientChatCommand === "function" &&
+      filename.endsWith("/services/chat/chatCommands.js")) {
+    commandsHooked = true;
+    const commandsDir = path.join(path.dirname(filenameRaw), "commands");
+    for (const key of ["executeChatCommand", "executeClientChatCommand"]) {
+      const original = exported[key];
+      exported[key] = function withMiningEscalationDebugCommand(session, rawMessage, chatHub, options = {}) {
+        const handled = tryHandleDebugCommand(commandsDir, session, rawMessage, chatHub, options);
+        return handled || original.apply(this, arguments);
+      };
+    }
+    log(`/${DEBUG_COMMAND} and /${NUKE_COMMAND} registered (staff only).`);
+  }
+}
+
+const WATCHED_SUFFIXES = [
+  "/services/sovereignty/sovState.js",
+  "/services/mining/miningLedgerState.js",
+  "/services/dungeon/dungeonRuntime.js",
+  "/services/dungeon/dungeonUniverseRuntime.js",
+  "/services/dungeon/dungeonExplorationMgrService.js",
+  "/services/chat/chatCommands.js",
+];
+
+const watchedNames = new Set(WATCHED_SUFFIXES.map(name => path.basename(name, ".js")));
+const originalLoad = Module._load;
+Module._load = function patchedLoad(request, parent, isMain) {
+  const exported = originalLoad.apply(this, arguments);
+  if (exported && (typeof exported === "object" || typeof exported === "function") &&
+      watchedNames.has(path.basename(String(request), ".js"))) {
+    let filename = "";
+    try { filename = Module._resolveFilename(request, parent, isMain); } catch (_) { return exported; }
+    if (WATCHED_SUFFIXES.some((suffix) => normalizedPath(filename).endsWith(suffix))) { try { hookLoadedModule(exported, filename); } catch (error) { warn(`Hook skipped for ${filename}: ${error.message}`); } }
+  }
+  return exported;
+};
+
+// The ore patches (multiplier, tier distribution, escalation rock check) only
+// work if they are applied while the site service is compiled.
+if ((config.anyMultiplier || config.tierMix) &&
+    Object.keys(require.cache || {}).some((name) => normalizedPath(name).endsWith("/services/dungeon/dungeonUniverseSiteService.js"))) {
+  warn("The server had already loaded its ore code before this loader ran, so the Prospecting Array multipliers, " +
+    "Mining site tier distribution are NOT active. Native depletion listening remains independent.");
+}
+
+if (config.strictMiningSiteSize && Object.keys(require.cache || {}).some(name => normalizedPath(name).endsWith("/services/dungeon/dungeonUniverseRuntime.js"))) {
+  warn("Strict mining site size cannot attach: universe runtime already compiled. Restart with the loader enabled before runtime initialization.");
+}
+
+// Modules the server loaded before this loader ran are hooked from the cache.
+for (const [filename, cached] of Object.entries(require.cache || {})) {
+  if (cached && cached.exports && WATCHED_SUFFIXES.some((suffix) => normalizedPath(filename).endsWith(suffix))) {
+    log(`Attaching to an already loaded module: ${path.basename(filename)}`);
+    try { hookLoadedModule(cached.exports, filename); } catch (error) { warn(`Cached hook skipped: ${error.message}`); }
+  }
+}
+
+if (config.reset) log("Reset mining sites is requested for this start.");
+log("Loaded.");
