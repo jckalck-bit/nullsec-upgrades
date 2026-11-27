@@ -1,16 +1,17 @@
 {
-  "version": "1.2.2",
+  "version": "1.2.3",
   "files": {
-    "index-benefits.js": "d87a36eb363b741dd348ee30cc87590b6fbfcab6e8831814cd12f59043df0e25",
-    "diagnostics.js": "f78b5b418bbbdcf96b51a2a0dcdda97b7451a00c44c2088cbcc0354110934ef9",
-    "README.md": "edf28f8cd5b6faa0a4b9ce971d15d2d951730b8610ded2e2bef2d712c4ba1bf8",
-    "industrial-index.js": "8792aa0cd81672170feba39817629baeeeb56607fb95e342f22e92976c366b07",
+    "CHANGELOG.md": "abf52bdc7a6ae3b4294e35ce91f342e50ed0fc68fa16537ab9e2c486f2695ebe",
+    "README.md": "c8e95a8ff49d96ae20093306bf6f7368d63fa8c0ad86462c203092c4a10ffc88",
+    "client/menu.py": "260c6c16a9741e695091327492180a1865bcc1a5bb6afa8db26c3071194145c2",
+    "diagnostics.js": "2319f8e64ed52afa75768389e96e4c5af182628c574287dd320b20daabf63a35",
+    "evejs-launcher.mod.json": "a6cdcdea0c4d2153c5ae9070a959421f1a03d304bfced2c7f517c570637545c5",
     "evejs-launcher.settings-layout.json": "d1e33555ded6bc3013d00ca65ddf6b8698337b4f1567db52b49d32f26b0ff008",
-    "evejs-launcher.mod.json": "00aad03b86ad87704df4d17ed6362766dc750153989203191e32262ac5e21827",
-    "client/menu.py": "62f6f649c9ac96314841e4a3d681c98e58aedbc9a25b3064f145d5f31ffc6933",
-    "loader.js.disabled": "6152f78fdd8de6e092428d96c69fb530a2d23f6c05dfeac12131ef6bfad4b8dd",
-    "CHANGELOG.md": "ac2bc5c358214e192ecb95102c26115590d4149880ad1b41058f4cc25abed789"
+    "forced-tests.js": "7d0450fad61a8a322f2b216143eb438a9f78692a22eb99e074727cd940560e22",
+    "index-benefits.js": "bbafe0a00ee7243db14840a87af65fbb73de4b399b442220cf2aa8b190a1ebfe",
+    "industrial-index.js": "ae51bfc381851cec5437a20e8cfec98caf8bcf760d4840affdd661a33c2b9089",
+    "loader.js.disabled": "2aa0227526df5dd58d8d042258cd8914abc59bd104ca59bc78570e7cb6fb4131"
   },
-  "metadata_sha256": "d022f196e2da209f2d6effef99bcae1c3b643fce432450e44b0a1eec4052e21e",
-  "changelog_sha256": "ac2bc5c358214e192ecb95102c26115590d4149880ad1b41058f4cc25abed789"
+  "metadata_sha256": "1915a1ce75f39e2c7a103c452131db9dac90f68d51881a17270efd4b57052932",
+  "changelog_sha256": "abf52bdc7a6ae3b4294e35ce91f342e50ed0fc68fa16537ab9e2c486f2695ebe"
 }

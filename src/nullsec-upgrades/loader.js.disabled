@@ -1,20 +1,26 @@
 "use strict";
+const { isMainThread } = require("node:worker_threads");
+// Workers inherit NODE_OPTIONS and may inherit the world's environment before
+// their entrypoint assigns the correct owner role. Never initialize this mod in
+// worker threads or known child-process worker entrypoints.
+const entry = String(process.argv?.[1] || '').replace(/\\/g, '/');
+const ownerAtPreload = String(process.env.EVEJS_GAMESTORE_OWNER_ROLE || '').trim().toLowerCase();
+if (!isMainThread || /\.worker\.(?:c?js)$/.test(entry) ||
+    (ownerAtPreload && !['world','standalone'].includes(ownerAtPreload) && !entry.endsWith('/server/index.js'))) return;
 const fs = require("node:fs");
 const path = require("node:path");
 const Module = require("node:module");
 
-const TAG = "[Nullsec upgrades]";
+const TAG = "[Nullsec Upgrades]";
 const MOD_ROOT = __dirname;
 const EVEJS_ROOT = path.resolve(MOD_ROOT, "..", "..");
 const CONFIG_PATH = path.join(EVEJS_ROOT, "config", "nullsec-upgrades.json");
 const RESET_KEY = "resetNullSpawnedSites";
-const MULTIPLIER_KEYS = { 1: "prospectingArray1Multiplier", 2: "prospectingArray2Multiplier", 3: "prospectingArray3Multiplier" };
 const ESCALATIONS_KEY = "miningEscalations";
 const CHANCE_KEYS = { 1: "escalationChanceArray1", 2: "escalationChanceArray2", 3: "escalationChanceArray3" };
 const RESPAWN_DEFAULTS = { 1: 60, 2: 260, 3: 600 };
 const CHANCE_DEFAULTS = { 1: 5, 2: 15, 3: 25 };
 const TIER_KEY = "tierDistribution";
-const MAX_MULTIPLIER = 1000;
 const ESCALATION_LIFETIME_MS = 24 * 60 * 60 * 1000;
 const ESCALATION_ORIGIN = "nullsec_escalation";
 const ESCALATION_FAMILY = "nullsec_escalation";
@@ -26,14 +32,6 @@ const ESCALATION_SLOT_FIRST = 500; // site-ID slots 500..999 of the sov_prospect
 const ESCALATION_SLOT_LAST = 999;
 
 const round2 = (value) => Math.round(value * 100) / 100;
-
-// Ore tier mix for Prospecting Array sites (share of rocks per tier).
-const TIER_MIX = Object.freeze([
-  { grade: 3, share: 0.50 }, // tier IV
-  { grade: 2, share: 0.30 }, // tier III
-  { grade: 1, share: 0.15 }, // tier II
-  { grade: 0, share: 0.05 }, // tier I
-]);
 
 // Every ore comes in four grades, ordered tier I -> tier IV (type IDs).
 const ORE_GRADE_FAMILIES = Object.freeze([
@@ -64,8 +62,24 @@ for (const family of ORE_GRADE_FAMILIES) family.forEach((typeID) => ORE_FAMILY_B
 
 
 let verbose = false;
-function log(message) { if (!verbose) return; process.stdout.write(`${TAG} ${message}\n`); }
-function warn(message) { if (!verbose) return; process.stderr.write(`${TAG} WARNING: ${message}\n`); }
+let diagnosticState = null;
+let debugStartupConfig = null;
+let lastForcedTestAt = 0;
+let forcedJob = null;
+let debugNativeHooks = null;
+function diagnosticOwner() { return verbose && isWorldOwner(); }
+function activeDiagnostics() {
+  if (!diagnosticOwner()) return null;
+  if (!diagnosticState) {
+    diagnosticState = require('./diagnostics').create(config, log);
+    // Set the instance first, so mark/log cannot recurse into initialization.
+    process.stdout.write(`${TAG} Verbose diagnostics initialized in world owner (PID ${process.pid}); full report in Feature Validation.\n`);
+    diagnosticState.mark('verbose',true,'World-owner verbose diagnostics active');
+  }
+  return diagnosticState;
+}
+function log(message) { if (!diagnosticOwner()) return; activeDiagnostics(); process.stdout.write(`${TAG} ${message}\n`); }
+function warn(message) { if (!diagnosticOwner()) return; activeDiagnostics(); process.stderr.write(`${TAG} WARNING: ${message}\n`); }
 
 function valid(v,min,max,fallback) { return typeof v === "number" && Number.isFinite(v) && v>=min && v<=max && Math.abs(v*100-Math.round(v*100))<1e-6 ? v : fallback; }
 function readConfig() {
@@ -87,6 +101,7 @@ function readConfig() {
   }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return config;
   verbose = parsed.verboseLogging === true;
+  if (verbose) debugStartupConfig = parsed;
   config.commands = parsed.commands === true;
   config.indexPoints = parsed.indexPoints === true;
   config.indexEscalation = config.indexPoints && parsed.indexEscalation === true;
@@ -138,8 +153,14 @@ function clearResetSwitch() {
 
 const config = readConfig();
 config.verbose = verbose;
-const diagnostics = require("./diagnostics").create(config, log);
-log(diagnostics.report());
+let targetVersion;
+try { targetVersion = JSON.parse(fs.readFileSync(path.join(EVEJS_ROOT, 'config', 'version.json'), 'utf8')).evejsVersion; } catch (_) {}
+if (targetVersion !== '261126.2') { warn('Unsupported EveJS version; loader not activated. Expected 261126.2.'); return; }
+const diagnostics = Object.freeze({
+  mark(...args) { if (diagnosticOwner()) activeDiagnostics().mark(...args); },
+  snapshot() { return activeDiagnostics()?.snapshot() || []; },
+  report() { return activeDiagnostics()?.report() || 'Diagnostics disabled (Verbose Logging OFF or non-world process).'; }
+});
 const toInt = (value, fallback = 0) => {
   const number = Number(value);
   return Number.isFinite(number) ? Math.trunc(number) : fallback;
@@ -209,7 +230,8 @@ function mixFor(tier, rng = Math.random) {
 }
 function gradePlanFor(siteID, rows, instance) {
   const key = `${instance.instanceID || siteID}:${instance.timers?.createdAtMs || 0}:${rows.length}`;
-  if (gradePlanCache.has(key)) return gradePlanCache.get(key);
+  const cachedPlan = gradePlanCache.get(key);
+  if (cachedPlan) return cachedPlan;
   let counter = 0;
   const TIER_MIX = mixFor(prospectingTier(instance), () => hashFraction(`${key}:${counter++}`));
   const eligible = [];
@@ -236,8 +258,10 @@ function gradePlanFor(siteID, rows, instance) {
   }
   if (gradePlanCache.size > 2000) gradePlanCache.clear();
   gradePlanCache.set(key, plan);
+  if (verbose) {
   const sharesOK = Math.abs(TIER_MIX.reduce((n,t)=>n+t.share,0)-1)<1e-6;
   for(const feature of ["tierDistribution","arrayDistribution","tierRandomness"]) diagnostics.mark(feature,sharesOK ? null : false,"Grade plan shares checked; actual rock volumes awaiting independent verification");
+  }
   return plan;
 }
 
@@ -263,7 +287,7 @@ const internals = {
     if (!Number.isFinite(base) || base <= 0) return quantity;
     const scaled = Math.max(1, Math.round(base * multiplier));
     const result = Math.min(scaled, Number.MAX_SAFE_INTEGER);
-    diagnostics.mark("oreScaling", Number.isSafeInteger(result) && result > 0, "Generated quantity arithmetic checked; live rock totals not checked");
+    if (verbose) diagnostics.mark("oreScaling", Number.isSafeInteger(result) && result > 0 ? null : false, "Generated quantity arithmetic checked; live rock totals not checked");
     return result;
   },
 };
@@ -325,27 +349,67 @@ internals.naturalResources = (snapshot, systemID) => {
   }
   const result = Object.freeze({ power, workforce });
   cache.set(systemID, result);
-  diagnostics.mark("planetaryResources",Number.isFinite(power)&&Number.isFinite(workforce)&&power>=0&&workforce>=0,"Natural resource totals calculated; native final accounting not independently checked");
-  log(`Automatic planetary resources: system ${systemID}, power ${power}, workforce ${workforce}.`);
+  if (verbose) diagnostics.mark("planetaryResources",Number.isFinite(power)&&Number.isFinite(workforce)&&power>=0&&workforce>=0?null:false,"Natural resource totals calculated; native final accounting not independently checked");
+  if (verbose) log(`Automatic planetary resources: system ${systemID}, power ${power}, workforce ${workforce}.`);
   return result;
 };
 function patchPlanetaryResources(source) {
-  const anchor = '  const harvested = stateCache.localHarvestBySolarSystemID.get(solarSystemID) || null;';
-  if (source.split(anchor).length !== 2) throw new Error("unsupported local harvest anchor");
   source = source.replace(/\r\n/g, "\n");
+  const anchor = '  const harvested = stateCache.localHarvestBySolarSystemID.get(solarSystemID) || null;';
+  const denAnchor = '    localHarvest.workforce += Math.max(0, Number(contribution.workforce || 0) - denSiphon);';
+  if (source.split(anchor).length !== 2 || source.split(denAnchor).length !== 2) throw new Error("unsupported local harvest anchors");
   const start = source.indexOf(anchor), end = source.indexOf('\n}', start);
-  if(end < 0) throw new Error('local harvest boundary unavailable');
+  if (end < 0) throw new Error('local harvest boundary unavailable');
   const native = source.slice(start,end).replace('  return {','  const local = {');
-  return source.slice(0,start) + `  let virtual = null;
+  let patched = source.slice(0,start) + `${native}
+  let virtual = null;
   try { if(globalThis.__nullsecUpgrades.virtualResourcesEnabled()) virtual = globalThis.__nullsecUpgrades.naturalResources(stateCache.staticSnapshot, solarSystemID); } catch (_) {}
-${native}
+  if (virtual) virtual = {power:virtual.power, workforce:Math.max(0,virtual.workforce-(stateCache.nullsecDenSiphons?.get(solarSystemID)||0))};
   return globalThis.__nullsecUpgrades.boostResources(solarSystemID, virtual || local);` + source.slice(end);
+  if (config.automaticPlanetaryResources) patched = patched.replace(denAnchor,denAnchor+`
+    if (denSiphon > 0) {
+      const natural = Number(staticSnapshot.planetDefinitionsByPlanetID.get(normalizedSkyhook.planetID)?.workforce)||0;
+      const deduction = Math.min(Math.max(0,natural),denSiphon);
+      nextCache.nullsecDenSiphons ||= new Map();
+      nextCache.nullsecDenSiphons.set(normalizedSkyhook.solarSystemID,(nextCache.nullsecDenSiphons.get(normalizedSkyhook.solarSystemID)||0)+deduction);
+    }`);
+  if(verbose) patched += `
+;globalThis.__nullsecUpgrades.debugResourceSnapshot = function(systemID) {
+    if(!cache) return null;
+    const hub=[...cache.hubsByID.values()].find(h=>h.solarSystemID===systemID);
+    if(!hub)return null;
+    const resources=cache.hubSnapshotsByID.get(hub.hubID)?.resources;
+    if(!resources)return null;
+    const ss=cache.staticSnapshot, star=ss.starConfigurationsBySolarSystemID.get(systemID), ids=ss.planetsBySolarSystemID.get(systemID);
+    const harvested=cache.localHarvestBySolarSystemID.get(systemID);
+    let power=Number(harvested?.power)||Number(star?.power)||0, workforce=Number(harvested?.workforce)||0;
+    if(globalThis.__nullsecUpgrades.virtualResourcesEnabled() && ids && star){
+      power=Number(star.power)||0;workforce=0;
+      for(const id of new Set(ids)){const planet=ss.planetDefinitionsByPlanetID.get(id);if(!planet)return null;power+=Number(planet.power)||0;workforce+=Number(planet.workforce)||0;}
+      workforce=Math.max(0,workforce-(cache.nullsecDenSiphons?.get(systemID)||0));
+    }
+    return {power,workforce,transfer:getHubTransferDelta(hub,cache),actual:resources};
+  };`;
+  return patched;
 }
+
 function validSource(source, filename) {
   try { new (require("node:vm").Script)(Module.wrap(source), { filename }); return true; }
   catch (error) { warn(`Transformation rejected for ${filename}: ${error.message}`); return false; }
 }
 
+function patchFirstSpawnWait(source) {
+  source=source.replace(/\r\n/g,'\n');
+  const anchor='  const category = getUpgradeCategory(getUpgradeName(upgrade));';
+  if(source.split(anchor).length!==2)throw Error('Native first spawn wait anchor mismatch');
+  return source.replace(anchor,anchor+`
+  if (category === "prospecting") {
+    const tier = /\\bprospecting array ([123])\\b/i.exec(getUpgradeName(upgrade));
+    if (tier && (${JSON.stringify(config.instantRespawn)} || ${JSON.stringify(config.respawnMinutes)}[Number(tier[1])] === 0)) return null;
+  }`);
+}
+let lifecyclePlanReady = false, visibilityPatchReady = false;
+function isWorldOwner(){ const role=String(process.env.EVEJS_GAMESTORE_OWNER_ROLE||'').trim().toLowerCase(); return role==='world'||role==='standalone'||(!role&&process.env.EVEJS_TEST_STORE_ISOLATED==='1'); }
 // ---------------------------------------------------------------- 1. quantity
 const QUANTITY_PATTERN =
   /const quantity = exactClientContent\s*\?\s*(Math\.max\(0, toFiniteNumber\(rawQuantity, 0\)\))\s*:\s*(Math\.max\(1, toInt\(rawQuantity, 1_000\)\));/g;
@@ -353,29 +417,43 @@ const ORE_TYPE_PATTERN = /const oreTypeID = resolveMiningRockTypeID\(rock, insta
 
 {
   const originalCompile = Module.prototype._compile;
-  let mercoxitPending = true;
+  let lifecyclePending = true;
+  let firstSpawnPending = true;
+  let mercoxitPending = config.mercoxit === true;
   let strictPending = config.strictMiningSiteSize === true;
   let orePending = true;
   let resourcesPending = config.automaticPlanetaryResources === true || config.indexResources === true;
   Module.prototype._compile = function patchedCompile(content, filename) {
-    if (resourcesPending && normalizedPath(filename).endsWith("/services/sovereignty/sovModernState.js")) {
+    if(!isWorldOwner())return originalCompile.call(this,content,filename);
+    const normalized=normalizedPath(filename);
+    if(firstSpawnPending && normalized.endsWith('/services/dungeon/dungeonSiteSpawnPolicy.js')) {
+      firstSpawnPending=false;
+      try {const candidate=patchFirstSpawnWait(content);if(!validSource(candidate,filename))throw Error('Invalid first spawn transform');content=candidate;log('Prospecting first-spawn policy installed.');}
+      catch(e){if(verbose)diagnostics.mark('initialSpawn',false,'Native first-spawn transform rejected');warn(e.message);}
+    }
+    if (resourcesPending && normalized.endsWith("/services/sovereignty/sovModernState.js")) {
       resourcesPending = false;
       try {
         const candidate = patchPlanetaryResources(content);
-        if (validSource(candidate, filename)) { content = candidate; log("Automatic planetary resources hook installed."); }
-      } catch (error) { warn(`Automatic planetary resources skipped: ${error.message}`); }
+        if (validSource(candidate, filename)) { content = candidate; log("Automatic planetary resources hook installed."); } else throw new Error("Resource transform syntax invalid");
+      } catch (error) { if(verbose){diagnostics.mark("planetaryResources",false,"Native resource hook rejected");diagnostics.mark("indexResources",false,"Native resource hook rejected");} warn(`Automatic planetary resources skipped: ${error.message}`); }
     }
-    if (mercoxitPending && normalizedPath(filename).endsWith("/services/dungeon/dungeonUniverseRuntime.js")) {
+    if (lifecyclePending && normalized.endsWith("/services/dungeon/dungeonUniverseRuntime.js")) {
+      lifecyclePending=false;
+      try { const candidate=patchIndependentReplacement(content); if(validSource(candidate,filename)){content=candidate;lifecyclePlanReady=true;log('Independent replacement plan installed.');}else throw new Error('Replacement transform syntax invalid'); }catch(e){if(verbose){diagnostics.mark('respawn',false,'Independent replacement hook rejected');diagnostics.mark('instantRespawn',false,'Independent replacement hook rejected');}warn(`Independent replacement skipped: ${e.message}`);}
+    }
+    if (mercoxitPending && normalized.endsWith("/services/dungeon/dungeonUniverseRuntime.js")) {
       mercoxitPending=false;
-      try { const candidate=patchMercoxit(content.replace(/\r\n/g,"\n")); if(validSource(candidate,filename)){content=candidate;log("Mercoxit hook installed.");} } catch(e){warn(`Mercoxit hook skipped: ${e.message}`);}
+      try { const candidate=patchMercoxit(content.replace(/\r\n/g,"\n")); if(validSource(candidate,filename)){content=candidate;log("Mercoxit hook installed.");}else throw new Error("Mercoxit transform syntax invalid"); } catch(e){if(verbose)diagnostics.mark("mercoxit",false,"Native Mercoxit hook rejected");warn(`Mercoxit hook skipped: ${e.message}`);}
     }
-    if (strictPending && normalizedPath(filename).endsWith("/services/dungeon/dungeonUniverseRuntime.js")) {
-      try { const candidate = patchStrictProspectingSizes(content.replace(/\r\n/g, "\n")); if (validSource(candidate, filename)) { content = candidate; log("Strict mining site size active."); } } catch (error) { warn(`Strict size patch skipped: ${error.message}`); }
+    if (strictPending && normalized.endsWith("/services/dungeon/dungeonUniverseRuntime.js")) {
+      try { const candidate = patchStrictProspectingSizes(content.replace(/\r\n/g, "\n")); if (validSource(candidate, filename)) { content = candidate; log("Strict mining site size active."); }else throw new Error("Strict-size transform syntax invalid"); } catch (error) { if(verbose)diagnostics.mark("strictSize",false,"Native strict-size hook rejected");warn(`Strict size patch skipped: ${error.message}`); }
       strictPending = false;
     }
     if (typeof filename === "string" &&
-        filename.replace(/\\/g, "/").endsWith("/services/dungeon/dungeonUniverseSiteService.js")) {
-      let patched = content;
+        normalized.endsWith("/services/dungeon/dungeonUniverseSiteService.js")) {
+      let patched = content, visibilityCandidate = false;
+      try { const candidate=patchLogicalVisibility(patched);if(validSource(candidate,filename)){patched=candidate;visibilityCandidate=true;log('Occupied grid visibility hook installed.');}else throw new Error('Visibility transform syntax invalid');}catch(e){if(verbose){diagnostics.mark("respawn",false,"Native visibility hook rejected");diagnostics.mark("instantRespawn",false,"Native visibility hook rejected");}warn(`Logical visibility hook skipped: ${e.message}`);}
 
       if (config.anyMultiplier) {
         let matches = 0;
@@ -388,9 +466,11 @@ const ORE_TYPE_PATTERN = /const oreTypeID = resolveMiningRockTypeID\(rock, insta
           patched = next;
           log(`Ore multipliers active: Array 1 x${config.multipliers[1]}, Array 2 x${config.multipliers[2]}, Array 3 x${config.multipliers[3]} (${matches} ore quantity site(s) patched).`);
         } else {
+          if(verbose)diagnostics.mark("oreScaling",false,"Native ore quantity anchor not found");
           warn("Could not find the ore quantity code in this EveJS version; the Prospecting Array multipliers are NOT active.");
         }
       } else {
+        if(verbose && config.oreScaling)diagnostics.mark("oreScaling",true,"Configured multipliers are all 1; native quantities retained");
         log("All Prospecting Array multipliers are 1: ore volumes unchanged.");
       }
 
@@ -405,6 +485,7 @@ const ORE_TYPE_PATTERN = /const oreTypeID = resolveMiningRockTypeID\(rock, insta
           patched = withTiers;
           log("Mining site tier distribution active for Prospecting Array sites: 50% tier IV, 30% tier III, 15% tier II, 5% tier I.");
         } else {
+          if(verbose)for(const feature of ["tierDistribution","arrayDistribution","tierRandomness"])diagnostics.mark(feature,false,"Native ore type anchor not found");
           warn("Could not find the ore type code in this EveJS version; Mining site tier distribution is NOT active.");
         }
       }
@@ -414,12 +495,45 @@ const ORE_TYPE_PATTERN = /const oreTypeID = resolveMiningRockTypeID\(rock, insta
         if (/\bresolveItemByTypeID\b/.test(patched)) appended += "\n;globalThis.__nullsecUpgrades.itemByTypeID = resolveItemByTypeID;";
         else warn("Could not find the item lookup in this EveJS version; Mining site tier distribution will weigh rocks by quantity instead of m3.");
       }
+      if (verbose) {
+        // Compare two executions of the same native descriptor generator, one with mod transformations omitted.
+        const begin=patched.indexOf('function listMiningObjectiveRockDescriptors(instance, populationHints) {');
+        const end=patched.indexOf('\n// A captured object',begin);
+        if(begin>=0&&end>begin){
+          let section=patched.slice(begin,end).replace('function listMiningObjectiveRockDescriptors(instance, populationHints) {','function listMiningObjectiveRockDescriptors(instance, populationHints, nullsecNativeBaseline = false) {');
+          section=section.replace('globalThis.__nullsecUpgrades.pickOreType(instance, populationHints, rockRowIndex, resolveMiningRockTypeID(rock, instance))','(nullsecNativeBaseline ? resolveMiningRockTypeID(rock, instance) : globalThis.__nullsecUpgrades.pickOreType(instance, populationHints, rockRowIndex, resolveMiningRockTypeID(rock, instance)))');
+          section=section.replace(/globalThis\.__nullsecUpgrades\.scaleQuantity\(instance, (exactClientContent \? [^;]+)\);/, '($1);');
+          // Preserve original scaled expression on normal calls.
+          const orig=patched.slice(begin,end).match(/globalThis\.__nullsecUpgrades\.scaleQuantity\(instance, (exactClientContent \? [^;]+)\);/);
+          if(orig) section=section.replace('const quantity = ('+orig[1]+');','const quantity = nullsecNativeBaseline ? ('+orig[1]+') : globalThis.__nullsecUpgrades.scaleQuantity(instance, '+orig[1]+');');
+          patched=patched.slice(0,begin)+section+patched.slice(end);
+          appended += '\n;globalThis.__nullsecUpgrades.debugRockDescriptors = listMiningObjectiveRockDescriptors;globalThis.__nullsecUpgrades.itemByTypeID = resolveItemByTypeID;';
+        }
+      }
       if (appended) patched += appended + "\n";
-      if (validSource(patched, filename)) content = patched;
+      if (validSource(patched, filename)) {content = patched;visibilityPatchReady=visibilityCandidate;}
+      else if(verbose)for(const feature of ['respawn','instantRespawn','oreScaling','tierDistribution','arrayDistribution','tierRandomness'])diagnostics.mark(feature,false,'Native site service transform failed syntax validation');
       orePending = false;
     }
-    if (!strictPending && !orePending && !mercoxitPending && !resourcesPending && Module.prototype._compile === patchedCompile) Module.prototype._compile = originalCompile;
-    return originalCompile.call(this, content, filename);
+    if (!firstSpawnPending && !lifecyclePending && !strictPending && !orePending && !mercoxitPending && !resourcesPending && Module.prototype._compile === patchedCompile) Module.prototype._compile = originalCompile;
+    const compiled=originalCompile.call(this, content, filename);
+    if(diagnosticOwner()) {
+      debugNativeHooks ||= new Map();
+      if(normalized.endsWith('/services/dungeon/dungeonSiteSpawnPolicy.js')) {
+        debugNativeHooks.set('initialSpawn',content.includes('if (tier && ('));
+      }else if(normalized.endsWith('/services/dungeon/dungeonUniverseRuntime.js')) {
+        debugNativeHooks.set('replacement',content.includes('globalThis.__nullsecUpgrades.planProspectingSlot('));
+        debugNativeHooks.set('mercoxit',content.includes('globalThis.__nullsecUpgrades.mercoxitDefinition('));
+        debugNativeHooks.set('strictSize',content.includes('if (level === 1) return name === "small "'));
+      }else if(normalized.endsWith('/services/dungeon/dungeonUniverseSiteService.js')) {
+        debugNativeHooks.set('visibility',content.includes('globalThis.__nullsecUpgrades.hideDepletedRoot(next)'));
+        debugNativeHooks.set('oreScaling',(content.match(/__nullsecUpgrades\.scaleQuantity\(instance/g)||[]).length===2);
+        debugNativeHooks.set('tierDistribution',(content.match(/__nullsecUpgrades\.pickOreType\(instance/g)||[]).length===2 && typeof internals.itemByTypeID==='function');
+      }else if(normalized.endsWith('/services/sovereignty/sovModernState.js')) {
+        debugNativeHooks.set('resources',content.includes('globalThis.__nullsecUpgrades.boostResources(solarSystemID, virtual || local)'));
+      }
+    }
+    return compiled;
   };
 }
 
@@ -604,6 +718,82 @@ function mutateState(fn) {
   durableState = next;
   return result;
 }
+function logicalReady(){return lifecyclePlanReady && visibilityPatchReady;}
+function managedDepleted(site){return !!site && site.lifecycleState==='completed' && site.lifecycleReason==='depleted' && (isProspectingSite(site)||isMercoxitSite(site)||site.siteOrigin===ESCALATION_ORIGIN);}
+internals.hideDepletedRoot = managedDepleted;
+internals.retireDepletedSlot = site => logicalReady() && managedDepleted(site) && (isProspectingSite(site)||isMercoxitSite(site));
+function positionClear(position, others){
+  const p = position && [position.x,position.y,position.z].map(Number);
+  if (!p || !p.every(Number.isFinite)) return false;
+  return others.every(row=>{
+    const q=row.position && [row.position.x,row.position.y,row.position.z].map(Number);
+    return q && q.every(Number.isFinite) && Math.hypot(p[0]-q[0],p[1]-q[1],p[2]-q[2])>1000000;
+  });
+}
+// Stable active slot; fresh slots only when creating a replacement. Reserve 50..99 for
+// standard prospecting replacements, 100..499 for Mercoxit, 500..999 for escalations.
+// A slot is never reused while any native instance still names its ID.
+function selectFreeSlot({rows, system, preferred, first, last, rotation, claimed, siteID, placement}) {
+  const used = new Set(rows.map(r=>Number(r.metadata?.siteID || r.spawnState?.siteID)).filter(Number.isSafeInteger));
+  const candidates = [preferred]; for(let i=first;i<=last;i++)if(i!==preferred)candidates.push(i);
+  for (const slot of candidates){
+    if (!Number.isInteger(slot)||slot<0||slot>=1000||claimed.has(slot)||used.has(siteID('sov_prospecting',system,slot))) continue;
+    const p=placement(system,'sov_prospecting',slot,rotation)?.position;
+    if(positionClear(p,rows.filter(r=>r.position))) {claimed.add(slot);return slot;}
+  }
+  return null;
+}
+internals.planProspectingSlot = (system,hubID,upgradeTypeID,baseSlot,nativeRotation,now,claimed,siteID,placement) => {
+  if (!logicalReady()) return {slot:baseSlot,rotation:nativeRotation};
+  try {
+    const key=`${system}:${upgradeTypeID}`, state=loadState(), rows=getDungeonRuntime().listInstancesBySystem(system);
+    const matching=rows.filter(r=>isProspectingSite(r)&&Number(sovHubOf(r)?.upgradeTypeID)===Number(upgradeTypeID)&&Number(sovHubOf(r)?.sourceHubID)===Number(hubID));
+    const current=matching.find(r=>['active','seeded','paused'].includes(r.lifecycleState)) || matching.find(r=>!managedDepleted(r));
+    if(current){const slot=Number(current.metadata?.slotIndex);if(!Number.isInteger(slot)||claimed.has(slot))return null;claimed.add(slot);return {slot,rotation:Number(current.metadata?.rotationIndex)||0};}
+    const terminal=matching.filter(managedDepleted);
+    const latest=terminal.reduce((best,r)=>!best||Number(r.metadata?.rotationIndex)>Number(best.metadata?.rotationIndex)?r:best,null);
+    const recorded=state.rotations?.[key];
+    const rotation=Math.max(nativeRotation, recorded?.hub===Number(hubID)?Number(recorded.next)||0:0,latest?Number(latest.metadata?.rotationIndex||0)+1:0);
+    const recoveredDeadline=latest ? Number(latest.timers?.completedAtMs||latest.timers?.lastUpdatedAtMs||now)+internals.respawnDelay(latest,0):0;
+    // Recover only the newest not-yet-journaled completion, never resurrect a previous cooldown after a replacement.
+    if(latest && (!recorded || recorded.hub!==Number(hubID) || Number(recorded.lastInstance)<Number(latest.instanceID)))recordCooldown(latest,recoveredDeadline);
+    if((Number(loadState().cooldowns[key])||0)>Math.max(now,Date.now())) return null;
+    if(baseSlot>=50) return null; // avoid reserved ranges if upstream changes its allocation scheme
+    const slot=selectFreeSlot({rows,system,preferred:baseSlot,first:50,last:99,rotation,claimed,siteID,placement});
+    if(slot===null){warn('No clear replacement slot; native terminal grid remains protected.');return null;}
+    return {slot,rotation};
+  }catch(e){warn(`Prospecting slot planning failed: ${e.message}`);return null;}
+};
+function patchIndependentReplacement(source){
+  source=source.replace(/\r\n/g,'\n');
+  const start=source.indexOf('function buildProspectingDefinitionsForSystem('), end=source.indexOf('\nfunction listSovereigntySourceSystemIDs()',start);
+  if(start<0||end<0)throw new Error('prospecting definition anchors missing');
+  let section=source.slice(start,end);
+  const a='  const upgrades = listParsedOnlineUpgrades(normalizedContext, parseProspectingUpgrade);';
+  const b=`    const slotIndex = allocateSovSlotIndex(slotAllocations, "sov_prospecting", systemID);
+    const rotationIndex = resolveDesiredSovSlotRotationIndex(
+      options,
+      "sov_prospecting",
+      systemID,
+      slotIndex,
+    );`;
+  if(section.split(a).length!==2||section.split(b).length!==2)throw new Error('prospecting slot anchors mismatch');
+  section=section.replace(a,a+'\n  const nullsecClaimedSlots = new Set();');
+  section=section.replace(b,`    const nativeSlot = allocateSovSlotIndex(slotAllocations, "sov_prospecting", systemID);
+    const nativeRotation = resolveDesiredSovSlotRotationIndex(options,"sov_prospecting",systemID,nativeSlot);
+    const nullsecSlot = globalThis.__nullsecUpgrades.planProspectingSlot(systemID,normalizedContext.sovereignty.hubID,toInt(upgrade.upgrade && upgrade.upgrade.typeID,0),nativeSlot,nativeRotation,nowMs,nullsecClaimedSlots,buildUniverseSiteID,buildUniverseSitePlacement);
+    if (!nullsecSlot) continue;
+    const slotIndex = nullsecSlot.slot, rotationIndex = nullsecSlot.rotation;`);
+  source=source.slice(0,start)+section+source.slice(end);
+  const rotationAnchor='function buildSovereigntyRotationDefinitionFromInstance(\n  instance,\n  nowMs = Date.now(),\n  options = {},\n) {';
+  if(source.split(rotationAnchor).length!==2)throw new Error('native rotation anchor mismatch');
+  return source.replace(rotationAnchor,rotationAnchor+'\n  if (globalThis.__nullsecUpgrades.retireDepletedSlot(instance)) return null;');
+}
+function patchLogicalVisibility(source){
+  const a='if (["tale-slot", "tale-final"].includes(previous.metadata?.incursionAdmission?.placement)) {';
+  if(source.split(a).length!==2)throw new Error('native occupied root visibility anchor mismatch');
+  return source.replace(a,'if (["tale-slot", "tale-final"].includes(previous.metadata?.incursionAdmission?.placement) || (next && globalThis.__nullsecUpgrades.hideDepletedRoot(next))) {');
+}
 function upgradeKey(site) {
   if (!isProspectingSite(site)) return null;
   const hub = sovHubOf(site);
@@ -666,7 +856,17 @@ internals.mercoxitDefinition = (hub, now, build, template) => {
     const active=getDungeonRuntime().listInstancesBySystem(hub.sourceSystemID,{full:true}).find(s=>isMercoxitSite(s)&&mercoxitKey(sovHubOf(s))===mercoxitKey(hub)&&['active','seeded','paused'].includes(s.lifecycleState));
     const row=mercoxitPlan(marked,now,!!active);
     if (!row) return null;
-    return build(template,'sov_prospecting',hub.sourceSystemID,row.slot,now,marked,{rotationIndex:active ? Number(active.metadata?.rotationIndex||0) : row.rotation, label:'Enormous Mercoxit Deposit',tags:['prospecting','mercoxit'],siteLifetimeMinutes:525600});
+    const system=hub.sourceSystemID,key=mercoxitKey(hub),rotation=active?Number(active.metadata?.rotationIndex||0):row.rotation;
+    let slot=active?Number(active.metadata?.slotIndex):row.slot;
+    if(!active && logicalReady()) {
+      const rows=getDungeonRuntime().listInstancesBySystem(system);
+      const reserved=new Set(Object.entries(loadState().mercoxit||{}).filter(([k])=>k!==key&&k.startsWith(`${system}:`)).map(([,v])=>v.slot));
+      const helper=universeHelpers(getUniverseRuntime());
+      slot=selectFreeSlot({rows,system,preferred:row.slot,first:100,last:499,rotation,claimed:reserved,siteID:helper.buildUniverseSiteID,placement:helper.buildUniverseSitePlacement});
+      if(slot===null)return null;
+      if(slot!==row.slot)mutateState(s=>{s.mercoxit[key].slot=slot;});
+    }
+    return build(template,'sov_prospecting',system,slot,now,marked,{rotationIndex:rotation, label:'Enormous Mercoxit Deposit',tags:['prospecting','mercoxit'],siteLifetimeMinutes:525600});
   } catch(e) { warn(`Mercoxit definition skipped: ${e.message}`); return null; }
 };
 function mercoxitChange(change,site) {
@@ -677,20 +877,29 @@ function mercoxitChange(change,site) {
     if (!row || row.lastInstance===site.instanceID) return;
     mutateState(s=>{const r=s.mercoxit[key]; r.ready=Math.max(0,r.ready-1); r.lastInstance=site.instanceID; r.rotation=Number(site.metadata?.rotationIndex||0); mercoxitAdvance(r,now,true);});
     mercoxitWake(key,loadState().mercoxit[key].deadline);
-    log(`Mercoxit spawned in ${site.solarSystemID}; reserves ${loadState().mercoxit[key].ready}.`);
+    if(verbose){const reserves=loadState().mercoxit[key].ready;diagnostics.mark('mercoxit',Number.isSafeInteger(reserves)&&reserves>=0&&reserves<=config.mercoxitMax?null:false,'Native Mercoxit created; reserve capacity checked; timing pending');log(`Mercoxit spawned in ${site.solarSystemID}; reserves ${reserves}.`);}
   } else if (change.changeType==='updated' && change.after?.lifecycleState==='completed' && change.before?.lifecycleState!=='completed' && change.after.lifecycleReason==='depleted') {
     mutateState(s=>{const r=s.mercoxit?.[key]; if(!r)return; r.rotation++; mercoxitAdvance(r,now,false);});
-    requestDepletedTeardown(site);
     mercoxitWake(key,now);
   } else if (change.changeType==='removed') {
     mercoxitWake(key,now);
   }
 }
 function patchMercoxit(source) {
-  const a='    const definition = buildSovGuaranteedDefinition(\n      template,\n      "sov_prospecting",';
+  const start=source.indexOf('function buildProspectingDefinitionsForSystem('),end=source.indexOf('\nfunction listSovereigntySourceSystemIDs()',start);
+  if(start<0||end<0)throw new Error('Mercoxit definition anchor missing');
+  let section=source.slice(start,end);
+  const a='  for (const upgrade of upgrades) {';
+  if(section.split(a).length!==2)throw new Error('Mercoxit upgrade anchor mismatch');
+  section=section.replace(a,a+`
+    if (upgrade.tier === 3 && globalThis.__nullsecUpgrades.mercoxitEnabled()) {
+      const hub = {provider:"sov_hub",upgradeCategory:"prospecting",mineral:upgrade.mineral,upgradeTier:upgrade.tier,upgradeTypeID:toInt(upgrade.upgrade && upgrade.upgrade.typeID,0)||null,upgradeName:normalizeText(upgrade.upgrade && upgrade.upgrade.name,""),sourceSystemID:systemID,sourceHubID:normalizedContext.sovereignty.hubID,targetSystemID:systemID,jumpsFromSource:0,sourceRefs:["ccpSovHub","ccpEquinoxSovUpdates"]};
+      const mercoxit=globalThis.__nullsecUpgrades.mercoxitDefinition(hub,nowMs,buildSovGuaranteedDefinition,dungeonAuthority.listTemplatesByFamily("ore").find(t=>t.templateID==="client-dungeon:12986"));
+      if(mercoxit) definitions.push(mercoxit);
+    }`);
+  source=source.slice(0,start)+section+source.slice(end);
   const b='  const spawnFamilyKey = normalizeLowerText(\n    instance && instance.metadata && instance.metadata.spawnFamilyKey,';
-  if(source.split(a).length!==2 || source.split(b).length!==2) throw new Error('Mercoxit native anchors unavailable');
-  source=source.replace(a,`    if (upgrade.tier === 3 && globalThis.__nullsecUpgrades.mercoxitEnabled()) {\n      const mercoxit = globalThis.__nullsecUpgrades.mercoxitDefinition(sovHub, nowMs, buildSovGuaranteedDefinition, dungeonAuthority.listTemplatesByFamily("ore").find(t => t.templateID === "client-dungeon:12986"));\n      if (mercoxit) definitions.push(mercoxit);\n    }\n`+a);
+  if(source.split(b).length!==2)throw new Error('Mercoxit rotation anchor unavailable');
   return source.replace(b,'  if (instance?.metadata?.sovHub?.nullsecMercoxit === true) return null;\n'+b);
 }
 
@@ -698,8 +907,11 @@ function scheduleCooldown(key, deadline) { setDeadline('cooldown',key,deadline);
 function recordCooldown(site, deadline) {
   const key = upgradeKey(site);
   if (!key) return;
-  mutateState(state => { state.cooldowns[key] = deadline; });
-  if (deadline > Date.now()) scheduleCooldown(key, deadline);
+  const hub=Number(sovHubOf(site)?.sourceHubID), id=Number(site.instanceID), next=Number(site.metadata?.rotationIndex||0)+1;
+  const previous=loadState().rotations?.[key];
+  if(previous?.hub===hub && Number(previous.lastInstance)>=id)return;
+  mutateState(state=>{state.cooldowns[key]=deadline;(state.rotations||={})[key]={hub,lastInstance:id,next:Math.max(next,previous?.hub===hub?Number(previous.next)||0:0)};});
+  scheduleCooldown(key,Math.max(1,deadline));
 }
 function activeEscalations(runtime, systemID) {
   return runtime.listInstancesBySystem(systemID, { full: true }).filter(site => site.siteOrigin === ESCALATION_ORIGIN && ["active", "seeded", "paused"].includes(site.lifecycleState) && Number(site.timers?.expiresAtMs || Infinity) > Date.now());
@@ -707,7 +919,7 @@ function activeEscalations(runtime, systemID) {
 function enqueueRoll(parent) {
   const tier = parent.siteOrigin === ESCALATION_ORIGIN ? 3 : prospectingTier(parent);
   const chance = Math.min(100, chanceForTier(tier) + indexBenefits.escalationBonus(parent.solarSystemID));
-  diagnostics.mark("indexEscalation", Number.isFinite(chance)&&chance>=0&&chance<=100,"Effective probability arithmetic checked");
+  if (verbose) diagnostics.mark("indexEscalation", Number.isFinite(chance)&&chance>=0&&chance<=100?null:false,"Effective probability arithmetic checked");
   const id = Number(parent.instanceID);
   const runtime = getDungeonRuntime();
   if (!config.escalations || !id || parent.spawnState?.nullsecEscalationRolled) return;
@@ -722,8 +934,8 @@ function enqueueRoll(parent) {
   });
   runtime.mergeSpawnState(id, { nullsecEscalationRolled: true, nullsecEscalationRolledAtMs: Date.now() }, { durable: true });
   mutateState(state => { delete state.rolls[id]; });
-  diagnostics.mark("escalations", Number.isFinite(roll)&&roll>=0&&roll<100,"Depletion roll persisted and parent marked");
-  log(`Site ${id} depleted: escalation roll ${roll.toFixed(2)} / ${chance}%.`);
+  if (verbose) diagnostics.mark("escalations", Number.isFinite(roll)&&roll>=0&&roll<100?null:false,"Depletion roll persisted and parent marked; successful creation awaiting evidence");
+  if (verbose) log(`Site ${id} depleted: escalation roll ${roll.toFixed(2)} / ${chance}%.`);
 }
 const pendingDrains = new Set();
 function requestDrain(systemID) {
@@ -740,7 +952,7 @@ function requestDrain(systemID) {
         try {
           const created = spawnEscalation({ instanceID: 0, solarSystemID: systemID, siteOrigin: 'sov_hub', spawnState: { sovHub: { upgradeCategory: 'prospecting', upgradeTier: 3 } } });
           if (!created?.instanceID) throw new Error('escalation creation returned no instance');
-          log(`Queued escalation spawned as ${created.instanceID}.`);
+          if(verbose){const stored=runtime.getInstance(created.instanceID);diagnostics.mark('escalations',stored?.siteOrigin===ESCALATION_ORIGIN&&activeEscalations(runtime,systemID).length<=2?null:false,'Queued site created and read back; persistence across restart pending');log(`Queued escalation spawned as ${created.instanceID}.`);}
         } catch(error) { mutateState(state => { state.queue[systemID] = (state.queue[systemID] || 0) + 1; }); throw error; }
       }
     } catch (error) { warn(`Escalation queue drain failed: ${error.message}`); }
@@ -908,30 +1120,17 @@ function createEscalationInstance(universeRuntime, built) {
   }
 }
 
-// Native scoped teardown port: run after the original listeners have parked a completed grid.
-// This does not bypass occupancy for unrelated sites or for administrative startup reset.
-const pendingTeardowns = new Set();
-function requestDepletedTeardown(instance) {
-  if (pendingTeardowns.has(instance.instanceID)) return;
-  pendingTeardowns.add(instance.instanceID);
+// Request scoped reconciliation only. Native occupancy grace remains the sole grid cleanup authority.
+const pendingReconciles = new Set();
+function requestReplacementReconcile(instance) {
+  if (!instance || (!isProspectingSite(instance) && !isMercoxitSite(instance))) return;
+  const system = Number(instance.solarSystemID);
+  if (!system || pendingReconciles.has(system)) return;
+  pendingReconciles.add(system);
   setImmediate(() => {
-    try {
-      const current = getDungeonRuntime().getInstance(instance.instanceID);
-      if (!current || current.lifecycleState !== "completed" || current.lifecycleReason !== "depleted" || (!isProspectingSite(current) && !isMercoxitSite(current) && current.siteOrigin !== ESCALATION_ORIGIN)) return;
-      const siteID = Number(current.metadata?.siteID || current.spawnState?.siteID);
-      if (!(siteID > 0)) return;
-      const runtime = require(path.join(EVEJS_ROOT, "server", "src", "space", "runtime"));
-      const scene = runtime.scenes?.get(current.solarSystemID);
-      if (!scene) return;
-      const service = require(path.join(SERVER_SERVICES, "dungeon", "dungeonUniverseSiteService"));
-      if (!service.isUniverseSiteTeardownParked?.(current.solarSystemID, current.instanceID)) return;
-      const flush = service._testing?.flushPendingSiteTeardownsForSite;
-      if (typeof flush !== "function") { warn("Native scoped teardown port unavailable; retaining occupancy grace."); return; }
-      flush(scene, siteID, { broadcast: true });
-      const scheduler = require(path.join(SERVER_SERVICES, "dungeon", "globalSiteSchedulerRuntime"));
-      if (typeof scheduler.queueDurableGlobalSiteReconciliation === "function") Promise.resolve(scheduler.queueDurableGlobalSiteReconciliation({ scanExisting: false, systemIDs: [current.solarSystemID] })).catch(error => warn(`Teardown reconcile: ${error.message}`));
-      log(`Depleted site ${current.instanceID} grid teardown completed.`);
-    } catch (error) { warn(`Depleted site teardown skipped: ${error.message}`); } finally { pendingTeardowns.delete(instance.instanceID); }
+    pendingReconciles.delete(system);
+    try { getUniverseRuntime().scheduleSystemUniversePersistentSitesReconcile(system,{reason:'nullsec-depletion',families:['sov_prospecting'],force:true,debounceMs:0}); }
+    catch (e) { warn(`Replacement reconcile failed: ${e.message}`); }
   });
 }
 
@@ -946,10 +1145,23 @@ function makeInstanceListener(dungeonRuntime, getUniverseRuntime) {
       if (!isEsc && !isSov) return;
       if (change.changeType === "created" && isSov) {
         const key = upgradeKey(instance);
-        if (key && Object.hasOwn(loadState().cooldowns, key) && Number(loadState().cooldowns[key]) <= Date.now()) mutateState(state => { delete state.cooldowns[key]; });
-        diagnostics.mark("respawn",null,"Native site creation observed; deadline comparison not independently verified");
-        log(`Array ${prospectingTier(instance)} site ${instance.instanceID} spawned in ${instance.solarSystemID}.`);
+        const due = key ? Number(loadState().cooldowns[key])||0 : 0;
+        if (key && due && due <= Date.now()) mutateState(state => { delete state.cooldowns[key]; });
+        if (verbose) {
+          const label=String(instance.metadata?.label||'').toLowerCase(), tier=prospectingTier(instance);
+          if(config.strictMiningSiteSize)diagnostics.mark('strictSize', tier===1?label.startsWith('small '):tier===3?label.startsWith('large '):! /^(small|large|enormous) /.test(label), 'Native created anomaly label checked');
+          const last=key&&loadState().rotations?.[key];
+          if(due && last){
+            const previous=dungeonRuntime.getInstance(last.lastInstance);
+            const distinct=!previous || (previous.metadata?.siteID!==instance.metadata?.siteID && positionClear(instance.position,[previous]));
+            const timed=Date.now()>=due;
+            diagnostics.mark('respawn',distinct&&timed,'Replacement identity and minimum cooldown checked; physical evacuation handled by native runtime');
+            if(config.instantRespawn)diagnostics.mark('instantRespawn',distinct&&timed?null:false,'Replacement created; exact latency and occupied-grid retention require live evidence');
+          }else diagnostics.mark('respawn',null,'Native creation observed; no depletion deadline available');
+        }
+        if (verbose) log(`Array ${prospectingTier(instance)} site ${instance.instanceID} spawned in ${instance.solarSystemID}.`);
       }
+      if (isSov && change.changeType === "removed" && managedDepleted(instance)) requestReplacementReconcile(instance);
       if (isEsc && (change.changeType === "removed" || (change.after && !["active", "paused", "seeded"].includes(change.after.lifecycleState)))) requestDrain(instance.solarSystemID);
       // Native completion verifies all authored rock identities and quantities.
       if (change.changeType !== "updated" || change.after?.lifecycleState !== "completed" || change.after.lifecycleReason !== "depleted" || change.before?.lifecycleState === "completed") return;
@@ -957,7 +1169,6 @@ function makeInstanceListener(dungeonRuntime, getUniverseRuntime) {
         const deadline = Number(change.after.timers?.completedAtMs || Date.now()) + internals.respawnDelay(change.after, 0);
         recordCooldown(change.after, deadline);
       }
-      requestDepletedTeardown(change.after);
       if (config.escalations) {
         enqueueRoll(change.after);
         requestDrain(instance.solarSystemID);
@@ -1018,7 +1229,6 @@ function forceEscalation(session) {
 
 // ------------------------------------------------ /nukeminingsites
 const NUKE_COMMAND = "nukeminingsites";
-const NUKE_FAMILIES = new Set(["ore", "ice", "gas"]);
 const NUKE_CHUNK_SIZE = 20;
 
 // Mining sites: ore, ice and gas sites the game spawns by itself (generated belts,
@@ -1103,6 +1313,97 @@ function nukeMiningSites(session, scope) {
     "you will get a message when it is done.";
 }
 
+// A forced check also inspects whether the relevant *live* hook is attached.
+// It never calls native mutations or loads new world data to establish readiness.
+function debugHookReadiness(key) {
+  if(!diagnosticOwner())return {status:'Not ready',detail:'Diagnostics disabled'};
+  const flag=k=>debugNativeHooks?.get(k)===true;
+  const result=(ok,detail)=>({status:ok?'Ready':'Not ready',detail});
+  const lifecycle=logicalReady()&&flag('replacement')&&flag('visibility')&&listenerHooked&&!!dungeonRuntimeModule&&!!universeRuntimeModule;
+  switch(key){
+    case 'escalations':return result(listenerHooked&&!!dungeonRuntimeModule&&!!universeRuntimeModule&&explorationHooked,'Depletion listener, dungeon runtimes and Journal hook');
+    case 'oreScaling':return result(!config.anyMultiplier||flag('oreScaling'),config.anyMultiplier?'Live quantity transform':'All multipliers are 1; native quantities retained');
+    case 'strictSize':return result(flag('strictSize'),'Live strict selector transform');
+    case 'tierDistribution':case 'arrayDistribution':case 'tierRandomness':return result(flag('tierDistribution')&&typeof internals.itemByTypeID==='function','Live ore-type transform and native item-volume lookup');
+    case 'initialSpawn':return result(flag('initialSpawn'),'Native first-spawn wait policy transform');
+    case 'respawn':case 'instantRespawn':return result(lifecycle,'Live replacement plan, scanner visibility and depletion listener');
+    case 'mercoxit':return result(lifecycle&&flag('mercoxit'),'Live Mercoxit definition and replacement hooks');
+    case 'planetaryResources':return result(flag('resources'),'Live local resource transform');
+    case 'industrialProgression':case 'industrialDecay':return result(industrialIndex.debugReady(key),'Live sovereignty, settlement timer and required ledger/shutdown hooks');
+    case 'indexPoints':case 'indexEscalation':case 'indexResources':return result(indexBenefits.debugReady()&&(key!=='indexResources'||flag('resources')),'Live sovereignty snapshot'+(key==='indexResources'?' and local resource transform':''));
+    case 'reset':return result(resetHooked&&!!dungeonRuntimeModule,'Live scoped startup reset hook');
+    case 'commands':return result(commandsHooked,'Live staff command dispatch hook');
+    case 'verbose':return result(!!diagnosticState,'World-owner diagnostics initialized');
+    default:return result(false,'Unknown feature');
+  }
+}
+
+function inspectLive(system,keys) {
+  if(!diagnosticOwner())return {};
+  const output={}, now=Date.now(), selected=new Set(keys);
+  const put=(key,ok,detail)=>{if(selected.has(key))output[key]={status:ok===null?'Pending':ok?'Passed':'Failed',detail,at:now,system};};
+  try {
+    const rows=dungeonRuntimeModule?.listInstancesBySystem(system)||[], active=rows.filter(r=>isProspectingSite(r)&&['active','seeded','paused'].includes(r.lifecycleState));
+    const journal=loadState(), prefix=system+':';
+    const deadlines=Object.entries(journal.cooldowns).filter(([k])=>k.startsWith(prefix));
+    const reserves=Object.entries(journal.mercoxit||{}).filter(([k])=>k.startsWith(prefix));
+    const liveMercoxit=rows.filter(r=>isMercoxitSite(r)&&['active','seeded','paused'].includes(r.lifecycleState));
+    put('respawn',deadlines.length?deadlines.every(([,v])=>Number.isFinite(v)&&v>=0):null,`${active.length} active; ${deadlines.length} cooldowns; ${deadlines.map(([k,v])=>k.split(':')[1]+': '+Math.max(0,Math.ceil((v-now)/1000))+'s').join(', ')}`);
+    put('instantRespawn',null,`${active.length} active; replacement latency requires a real depletion`);
+    put('initialSpawn',null,'Native gate '+(debugNativeHooks?.get('initialSpawn')?'installed':'not confirmed')+'; live new installation not observed');
+    put('mercoxit',reserves.length?reserves.every(([,r])=>Number.isSafeInteger(r.ready)&&r.ready>=0&&r.ready<=config.mercoxitMax):null,`${liveMercoxit.length} active; ${reserves.map(([k,r])=>k.split(':')[1]+': '+r.ready+'/'+config.mercoxitMax).join(', ')||'no reserve record'}`);
+    const sizes=active.map(r=>{const name=String(r.metadata?.label||r.spawnState?.label||'').toLowerCase(), tier=prospectingTier(r);return {name,tier,ok:tier===1?name.startsWith('small '):tier===3?name.startsWith('large '):tier===2&&!/^(small|large|enormous) /.test(name)&&!!name};});
+    put('strictSize',sizes.length?sizes.every(r=>r.ok):null,`${sizes.filter(r=>r.ok).length}/${sizes.length} existing Array sites match size (older retained sites may differ)`);
+    const escalations=rows.filter(r=>r.siteOrigin===ESCALATION_ORIGIN&&['active','seeded','paused'].includes(r.lifecycleState));
+    put('escalations',null,`${escalations.length} active incl. staff sites; ${Number(journal.queue[system])||0} queued; live roll evidence separate`);
+    if(['oreScaling','tierDistribution','arrayDistribution','tierRandomness'].some(k=>selected.has(k))){
+      let count=0,invalid=0,baseVolume=0,scaledVolume=0,gradeVolume=[0,0,0,0],remainingGrades=[0,0,0,0],eligible=0,liveCount=0,liveMismatch=0,gradeMismatch=0,gradeSites=0,limited=active.length>16;
+      const scene=require.cache[path.resolve(SERVER_SERVICES,'../space/runtime.js')]?.exports?.scenes?.get(system);
+      for(const summary of active.slice(0,16)){
+        const site=dungeonRuntimeModule.getInstance(summary.instanceID);if(!site)continue;
+        const hints=site.spawnState?.populationHints;if(!hints?.miningRocks||!internals.debugRockDescriptors)continue;
+        if(hints.miningRocks.length>5000||hints.miningRocks.reduce((n,r)=>n+Math.max(1,Number(r?.count)||1),0)>5000){limited=true;continue;}
+        const before=internals.debugRockDescriptors(site,hints,true), after=internals.debugRockDescriptors(site,hints,false);
+        if(before.length!==after.length){invalid++;continue;}
+        if(count+after.length>5000){limited=true;break;}
+        const siteGrades=[0,0,0,0];let siteEligible=0;
+        for(let i=0;i<after.length;i++){
+          if(count>=5000){limited=true;break;}
+          const b=before[i], a=after[i], mult=config.multipliers[prospectingTier(site)]||1, expected=mult===1?b.quantity:b.quantity>0?Math.min(Number.MAX_SAFE_INTEGER,Math.max(1,Math.round(b.quantity*mult))):b.quantity;
+          if(a.quantity!==expected)invalid++;
+          const volume=a.quantity*unitVolumeOf(a.oreTypeID);baseVolume+=b.quantity*unitVolumeOf(b.oreTypeID);scaledVolume+=volume;count++;
+          const family=ORE_FAMILY_BY_TYPE.get(a.oreTypeID);if(family){gradeVolume[family.indexOf(a.oreTypeID)]+=volume;siteGrades[family.indexOf(a.oreTypeID)]+=volume;siteEligible+=volume;eligible++;}
+          const entity=scene?.getEntityByID(a.entityID);if(entity?.dungeonSiteInstanceID===site.instanceID){liveCount++;if(Number(entity.miningOriginalQuantity)!==a.quantity||Number(entity.miningYieldTypeID)!==a.oreTypeID)liveMismatch++;const liveFamily=ORE_FAMILY_BY_TYPE.get(Number(entity.miningYieldTypeID));if(liveFamily)remainingGrades[liveFamily.indexOf(Number(entity.miningYieldTypeID))]+=Math.max(0,Number(entity.miningRemainingQuantity)||0)*unitVolumeOf(Number(entity.miningYieldTypeID));}
+        }
+        if(siteEligible>0 && config.tierMix){
+          const seed=`${site.instanceID||site.metadata?.siteID}:${site.timers?.createdAtMs||0}:${hints.miningRocks.length}`;let counter=0;
+          const target=mixFor(prospectingTier(site),()=>hashFraction(`${seed}:${counter++}`));
+          // Whole declared rows share one grade; a row's volume is the achievable rounding tolerance.
+          const largest=Math.max(0,...hints.miningRocks.map(r=>Math.max(1,Number(r?.count)||1)*Math.max(1,Number(r?.quantity??r?.remainingQuantity??r?.quantityPerRock)||1)*unitVolumeOf(Number(r?.typeID||r?.oreTypeID))*config.multipliers[prospectingTier(site)]));
+          if(target.some(t=>Math.abs(siteGrades[t.grade]-t.share*siteEligible)>largest+1))gradeMismatch++;
+          gradeSites++;
+        }
+      }
+      put('oreScaling' ,count?invalid===0&&liveMismatch===0:null,`${count} native descriptors: ${Math.round(baseVolume)} -> ${Math.round(scaledVolume)} m3; ${invalid} mismatch; ${liveCount} materialized checked (${liveMismatch} mismatch)${limited?' (bounded sample)':''}`);
+      const total=gradeVolume.reduce((a,b)=>a+b,0);const mix=total?gradeVolume.slice().reverse().map(v=>(100*v/total).toFixed(1)).join('/'):'n/a';
+      const remTotal=remainingGrades.reduce((a,b)=>a+b,0), rem=remTotal?remainingGrades.slice().reverse().map(v=>(100*v/remTotal).toFixed(1)).join('/'):'n/a';
+      for(const key of ['tierDistribution','arrayDistribution','tierRandomness'])put(key,gradeSites?gradeMismatch===0&&liveMismatch===0:null,`${gradeSites} sites, ${gradeMismatch} outside row-volume tolerance; generated IV/III/II/I % ${mix}; ${liveCount} live rocks, remaining % ${rem}${limited?' (bounded sample)':''}`);
+    }
+    if(selected.has('planetaryResources')||selected.has('indexResources')){
+      const r=internals.debugResourceSnapshot?.(system), idx=indexBenefits.debugSnapshot(system), n=config.indexResources?(idx?.cached||0):0;
+      const p=r&&Math.round(r.power*(1+n/100)), w=r&&Math.round(r.workforce*(1+n/100));
+      const ok=r? r.actual.power.localHarvest===p&&r.actual.workforce.localHarvest===w&&r.actual.workforce.available===Math.max(0,w+r.transfer):null;
+      for(const key of ['planetaryResources','indexResources'])put(key,ok,r?`Expected local ${p}/${w}; native ${r.actual.power.localHarvest}/${r.actual.workforce.localHarvest}; transfer ${r.transfer}; cached bonus ${n}%`:'No cached native hub resource snapshot');
+    }
+    const idx=indexBenefits.debugSnapshot(system);
+    put('indexPoints',idx?Number.isInteger(idx.live)&&idx.live===idx.industrial+idx.military+idx.strategic:null,idx?`Industrial ${idx.industrial}; military ${idx.military}; strategic ${idx.strategic}; live ${idx.live}; cached ${idx.cached}`:'No claimed system snapshot');
+    put('indexEscalation',idx&&idx.cached!==null?Number.isInteger(idx.cached)&&idx.cached>=0&&idx.cached<=15:null,idx?`Cached bonus ${idx.cached}; effective chances ${[1,2,3].map(t=>Math.min(100,chanceForTier(t)+idx.cached)).join('/')}%`:'No cached index snapshot');
+    const industrial=industrialIndex.debugSnapshot(system);
+    for(const key of ['industrialProgression','industrialDecay'])put(key,industrial?.saved?industrial.current===industrial.saved.points:null,industrial?`Native ${industrial.current}; journal ${industrial.saved?.points??'none'}; pending ${industrial.pending} m3`:'No claimed industrial index snapshot');
+  }catch(e){for(const key of keys)if(!output[key])put(key,null,'Read-only inspection unavailable: '+String(e.message||e).slice(0,120));}
+  for(const key of keys)if(!output[key])put(key,null,'No non-mutating live check available; forced and hook results are separate.');
+  return output;
+}
 function tryHandleDebugCommand(commandsDir, session, rawMessage, chatHub, options) {
   const text = String(rawMessage || "").trim();
   if (!text.startsWith("/")) return null;
@@ -1110,9 +1411,42 @@ function tryHandleDebugCommand(commandsDir, session, rawMessage, chatHub, option
   const name = (parts[0] || "").toLowerCase();
   if(name === "nullsecindexsnapshot") {
     const {hasStaffDebugRole}=require(path.join(commandsDir,"commandAccess"));
-    if(!verbose || !hasStaffDebugRole(session)) return {handled:true,returnValue:JSON.stringify({available:false,authorized:false})};
-    try {return {handled:true,returnValue:JSON.stringify({...industrialIndex.snapshot(resolveSessionSystemID(session)),authorized:true})};}
-    catch (_) {return {handled:true,returnValue:JSON.stringify({available:false,authorized:true})};}
+    if(!diagnosticOwner() || !hasStaffDebugRole(session)) return {handled:true,returnValue:JSON.stringify({available:false,authorized:false})};
+    try {
+      const view=(parts[1]||'index').toLowerCase();
+      if (view === 'test') {
+        const d=activeDiagnostics();
+        const requested=parts[2] || 'all';
+        const enabled=d.snapshot().map(row=>row.key);
+        const keys=requested==='all'?enabled:enabled.filter(key=>key===requested);
+        if (!keys.length) return {handled:true,returnValue:JSON.stringify({authorized:true,available:true,features:d.snapshot(),message:'No matching enabled feature.'})};
+        const now=Date.now();
+        if(forcedJob) return {handled:true,returnValue:JSON.stringify({authorized:true,available:true,features:d.snapshot(),busy:true,message:'A test is already running.'})};
+        if(lastForcedTestAt && now-lastForcedTestAt<500) return {handled:true,returnValue:JSON.stringify({authorized:true,available:true,features:d.snapshot(),message:'Test recently completed; use Refresh or retry.'})};
+        const job={keys:keys.slice(),system:resolveSessionSystemID(session),start:now,done:0,passed:0};forcedJob=job;
+        const next=()=>{
+          try {
+          if(!diagnosticOwner()){forcedJob=null;return;}
+          const key=job.keys[job.done];
+          if(!key){lastForcedTestAt=Date.now();forcedJob=null;log(`Forced checks: ${job.passed}/${job.done} passed in ${lastForcedTestAt-job.start} ms.`);return;}
+          const started=Date.now();let result;
+          try{result=require('./forced-tests').run({loaderPath:__filename,serverServices:SERVER_SERVICES,rawConfig:debugStartupConfig||{},keys:[key]})[key];}catch(e){result={status:'Failed',detail:String(e.message||e).slice(0,200)};}
+          result ||= {status:'Failed',detail:'Test produced no result'};
+          d.recordTest(key,{...result,durationMs:Date.now()-started,hook:debugHookReadiness(key)},requested==='all');
+          if(result.status==='Passed')job.passed++;job.done++;
+          if(job.done===job.keys.length){const live=inspectLive(job.system,job.keys);for(const [k,v] of Object.entries(live))d.recordInspection(k,v);}
+          setImmediate(next).unref();
+          } catch(e){forcedJob=null;lastForcedTestAt=Date.now();warn(`Forced checks aborted: ${String(e.message||e).slice(0,200)}`);}
+        };
+        setImmediate(next).unref();
+        return {handled:true,returnValue:JSON.stringify({authorized:true,available:true,features:d.snapshot(),busy:true,message:'Tests queued. Refresh to view results.'})};
+      }
+      if(view==='inspect'&&!forcedJob){const d=activeDiagnostics(), keys=d.snapshot().map(r=>r.key);for(const [k,v] of Object.entries(inspectLive(resolveSessionSystemID(session),keys)))d.recordInspection(k,v);}
+      const payload=view==='menu' ? {available:true} : ['validation','inspect'].includes(view)
+        ? {available:true,features:diagnostics.snapshot(),busy:!!forcedJob,message:forcedJob?`Tests running: ${forcedJob.done}/${forcedJob.keys.length}`:undefined}
+        : {...industrialIndex.snapshot(resolveSessionSystemID(session)),progressionEnabled:config.indexProgression===true};
+      return {handled:true,returnValue:JSON.stringify({...payload,authorized:true})};
+    } catch (_) {return {handled:true,returnValue:JSON.stringify({available:false,authorized:true})};}
   }
   if (!config.commands) return null;
   if (name !== DEBUG_COMMAND && name !== NUKE_COMMAND && !["nullsecstatus","nullsecdebug","nullsecvalidate","nullsecqueue"].includes(name)) return null;
@@ -1121,7 +1455,8 @@ function tryHandleDebugCommand(commandsDir, session, rawMessage, chatHub, option
   const reply = (message) => handledResult(chatHub, session, options, message);
   if (!hasStaffDebugRole(session)) return reply(`/${name} requires a staff/admin role.`);
   try {
-    diagnostics.mark("commands",true,"Staff command dispatch verified");
+    if (verbose && (name===DEBUG_COMMAND || name===NUKE_COMMAND)) diagnostics.mark("commands",null,"Staff command authorization passed; execution awaiting result");
+    if (name.startsWith("nullsec") && !verbose) return reply("Diagnostics disabled (Verbose Logging OFF).");
     if (name === "nullsecstatus") return reply(diagnostics.report());
     if (name.startsWith("nullsec")) {
       const id=resolveSessionSystemID(session);
@@ -1138,7 +1473,7 @@ function tryHandleDebugCommand(commandsDir, session, rawMessage, chatHub, option
       if(name==="nullsecvalidate") lines.push(diagnostics.report(),"Read-only snapshot; pending checks require gameplay evidence.");
       return reply(lines.join("\n"));
     }
-    if (name === DEBUG_COMMAND) return reply(forceEscalation(session));
+    if (name === DEBUG_COMMAND) { const result=forceEscalation(session); if(verbose)diagnostics.mark("commands",true,"Staff escalation command executed");return reply(result); }
     const scope = (parts[1] || "").toLowerCase();
     if (scope !== "local" && scope !== "all") {
       return reply(`Usage: /${NUKE_COMMAND} local (this system only) or /${NUKE_COMMAND} all (the whole universe).`);
@@ -1180,10 +1515,10 @@ function getUniverseRuntime() {
 // Applies whichever of our hooks belong to this module. Safe to call twice.
 const industrialIndex = require("./industrial-index").create({config,loadState,mutateState,log,warn,diagnostics});
 function hookLoadedModule(exported, filenameRaw) {
+  if (!exported || !isWorldOwner()) return;
   const filename = normalizedPath(filenameRaw);
-  if (!exported) return;
-  indexBenefits.attach(exported, filename);
   industrialIndex.attach(exported, filename);
+  indexBenefits.attach(exported, filename);
 
   // The Journal's escalating-path list: a service class, not a plain object.
   if (!explorationHooked && typeof exported === "function" && exported.prototype &&
@@ -1221,7 +1556,7 @@ function hookLoadedModule(exported, filenameRaw) {
     if (typeof exported.rotateUniversePersistentInstances === "function") {
       const rotate = exported.rotateUniversePersistentInstances;
       exported.rotateUniversePersistentInstances = function nullsecRotate(rotations, options = {}) {
-        if (!Array.isArray(rotations)) return rotate.apply(this, arguments);
+        if (logicalReady() || !Array.isArray(rotations)) return rotate.apply(this, arguments);
         const now = Number(options.nowMs ?? Date.now());
         const delayed = [], ready = [];
         for (const row of rotations) {
@@ -1229,9 +1564,9 @@ function hookLoadedModule(exported, filenameRaw) {
           if (key && site.lifecycleReason === "depleted" && Number(loadState().cooldowns[key]) > now) delayed.push(site.instanceID);
           else ready.push(row);
         }
-        const retired = delayed.length ? exported.purgeInstances(delayed, {source:"nullsec-cooldown"}) : null;
-        const result = rotate.call(this, ready, options);
-        return retired ? {...result, removedCount: Number(result.removedCount||0)+Number(retired.removedCount||0)} : result;
+        // Fail closed: retain the native terminal grid and do not force-purge a
+        // depleted instance just to enforce a custom cooldown.
+        return rotate.call(this, ready, options);
       };
       log("Sovereignty depletion lifecycle hook installed.");
     }
@@ -1246,7 +1581,7 @@ function hookLoadedModule(exported, filenameRaw) {
           const systems = new Set(options.systemIDs || definitions.map(site => site.solarSystemID));
           // No global scan: inspect only systems in the requested native reconcile.
           for (const system of systems) for (const site of exported.listInstancesBySystem(system)) {
-            if (site.siteOrigin === ESCALATION_ORIGIN) preserve.add(site.siteKey);
+            if (site.siteOrigin === ESCALATION_ORIGIN || managedDepleted(site)) preserve.add(site.siteKey);
             const key = upgradeKey(site);
             if (config.strictMiningSiteSize && key && ["active", "seeded", "paused"].includes(site.lifecycleState)) {
               const desired = definitions.find(def => def.siteKey === site.siteKey && upgradeKey(def) === key);
@@ -1286,9 +1621,9 @@ function hookLoadedModule(exported, filenameRaw) {
             mutateState(state => { state.cooldowns = {}; });
             for (const key of deadlines.keys()) if(key.startsWith("cooldown:")) deadlines.delete(key); armDeadlines();
             resetOK = true;
-            diagnostics.mark("reset",true,"Reset removal and cooldown clearing completed");
+            if (verbose) diagnostics.mark("reset",true,"Reset removal and cooldown clearing completed");
             log(`Reset mining sites: removed ${removed} Prospecting Array sites.`);
-          } catch (error) { diagnostics.mark("reset",false,"Reset failed"); warn(`Reset incomplete: ${error.message}`); }
+          } catch (error) { if (verbose) diagnostics.mark("reset",false,"Reset failed"); warn(`Reset incomplete: ${error.message}`); }
         }
         const finish = value => { if (resetOK) clearResetSwitch(); recoverPersistentWork(); return value; };
         const result = originalSweep.apply(this, args);
@@ -1327,10 +1662,11 @@ const originalLoad = Module._load;
 Module._load = function patchedLoad(request, parent, isMain) {
   const exported = originalLoad.apply(this, arguments);
   if (exported && (typeof exported === "object" || typeof exported === "function") &&
-      watchedNames.has(path.basename(String(request), ".js"))) {
+      watchedNames.has(path.basename(String(request), ".js")) && isWorldOwner()) {
     let filename = "";
     try { filename = Module._resolveFilename(request, parent, isMain); } catch (_) { return exported; }
-    if (WATCHED_SUFFIXES.some((suffix) => normalizedPath(filename).endsWith(suffix))) { try { hookLoadedModule(exported, filename); } catch (error) { warn(`Hook skipped for ${filename}: ${error.message}`); } }
+    const normalized = normalizedPath(filename);
+    if (WATCHED_SUFFIXES.some((suffix) => normalized.endsWith(suffix))) { try { hookLoadedModule(exported, filename); } catch (error) { warn(`Hook skipped for ${filename}: ${error.message}`); } }
   }
   return exported;
 };
@@ -1349,11 +1685,12 @@ if (config.strictMiningSiteSize && Object.keys(require.cache || {}).some(name =>
 
 // Modules the server loaded before this loader ran are hooked from the cache.
 for (const [filename, cached] of Object.entries(require.cache || {})) {
-  if (cached && cached.exports && WATCHED_SUFFIXES.some((suffix) => normalizedPath(filename).endsWith(suffix))) {
+  const normalized = normalizedPath(filename);
+  if (cached && cached.exports && WATCHED_SUFFIXES.some((suffix) => normalized.endsWith(suffix))) {
     log(`Attaching to an already loaded module: ${path.basename(filename)}`);
     try { hookLoadedModule(cached.exports, filename); } catch (error) { warn(`Cached hook skipped: ${error.message}`); }
   }
 }
 
 if (config.reset) log("Reset mining sites is requested for this start.");
-log("Loaded.");
+if (isWorldOwner()) log("Loaded in world owner.");

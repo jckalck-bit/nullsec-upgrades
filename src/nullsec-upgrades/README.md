@@ -1,18 +1,10 @@
-# 1.2.2 stable
+# Nullsec Upgrades 1.2.3
 
-Player-corporation sovereignty required for industrial credit and settlement. Empty batches and capped indices (when decay is disabled) skip progression calculations. Industrial progression errors propagate. Strip miners and standard ore miners reported working in beta.3; decay, Mercoxit queue and live stable regression testing remain pending.
+Target: EveJS 261126.2, Launcher 1.0.97, client 3724492. Import the ZIP through the launcher, configure, then restart the game server. Native and Docker are declared supported. Stop server and market before updating, and back up `config/nullsec-upgrades.json` and `config/nullsec-upgrades-state.json`. Docker uses the existing config mount. Do not run two versions simultaneously or rename the disabled loader manually. The loader enforces the exact date-version at runtime. The stable GitHub update channel is preserved; experimental update switching is not included.
 
-# 1.2.2-beta.3
+The independent replacement lifecycle protects occupied depleted grids: hide the managed beacon, choose a distinct free slot and position, and let native cleanup wait for evacuation. If no slot is clear, do not force physical removal. First-spawn wait is bypassed for a Prospecting Array only with Instant site respawn or its zero respawn timer; native claim, power, workforce and fuel checks remain. Existing journal deadlines are preserved. Graceful shutdown settles pending mining credits; an abrupt crash can lose a partial batch, and native database plus journal are not one transaction.
 
-Industrial Index Debug: enable Verbose Logging, restart, and open the shared Mods menu as a staff character. Shows current system mining volume, cache countdown and projected index progression. Refreshes while open; no additional persistence timer. Live client and server validation pending.
-
-# 1.2.2-beta.1
-
-Industrial progression now uses successful native mining ledger entries (final recovered units × native unit volume), with existing 60-second batching. Native ledger entry IDs guard duplicate credit within the process. Respawn uses sovereignty depletion events, native rotation and reconciliation exports rather than the previous respawn source transform. Existing settings and diagnostics retained. Beta: live server validation pending.
-
-# Nullsec upgrades 1.1.0 — sovereignty and resources update
-
-Install the ZIP using EveJS Launcher 1.0.86. The manifest declares native and Docker support; neither has been live tested. Restart the game server after configuration changes. No GitHub publication.
+The shared Mods menu is available with Verbose Logging ON and staff access. The launcher-owned shared-menu fix, if needed for client 3724492, remains separate from this mod. The validation tab uses collapsed cached results, independent live evidence and on-demand inspection. No validation polling or startup self-tests. Actual client rendering and native/Docker live integration have not been verified in this release audit. The full native-source regression suite could not be rerun because the server and launcher archives were not visible to the execution environment; isolated tests and syntax checks do not replace that suite. 17 isolated regression checks passed in this audit, including eight existing feature fixtures replayed against beta5 and the new runtime, plus startup index ordering, verbose gates, worker exclusion, deterministic grade plans, quantity arithmetic, reserve arithmetic, journal migration/reload and manifest parity. See CHANGELOG.md for historical changes.
 
 ## Configuration
 
@@ -61,24 +53,24 @@ When enabled, cached natural star and planetary power and workforce replace loca
 ## Compatibility and validation
 The native depletion listener and lifecycle/reconciliation wrappers are independent of mining-rock source text. Strict size selection, ore quantity/grade selection, planetary resource lookup and the shared native scheduler still require guarded source transforms. Transforms validate syntax and fall back to original source when anchors are missing. In particular, the respawn scheduler falls back to native timers if its source cannot be safely transformed. Verbose Logging (last config option) reports successful hooks, failures, deadlines, site creations and virtual resource totals; it is off by default.
 
-Offline validation: JavaScript syntax; manifest JSON; original server scheduler/strict/resource transformation syntax; unsupported scheduler source fallback; mocked native depletion, ownership lookup, cooldown persistence, replacement filtering, FIFO two-slot admission, queue reload, natural resource sums, and tier share totals. These are not live server tests. Full native/Docker testing, occupied-grid teardown behavior, integration with Better Moon Anomalies, unusual sovereignty upgrade removal/replacement paths, and full crash consistency remain unverified. Complete elimination of shared source rewriting and GitHub update integration are not implemented. The launcher does not conditionally hide every dependent field. No GitHub publication.
+Offline validation: JavaScript syntax; manifest JSON; original server scheduler/strict/resource transformation syntax; unsupported scheduler source fallback; mocked native depletion, ownership lookup, cooldown persistence, replacement filtering, FIFO two-slot admission, queue reload, natural resource sums, and tier share totals. These are not live server tests. Full native/Docker testing, occupied-grid teardown behavior, integration with Better Moon Anomalies, unusual sovereignty upgrade removal/replacement paths, and full crash consistency remain unverified. Native source rewriting remains; stable GitHub update integration is included. The launcher does not conditionally hide every dependent field. No GitHub publication.
 
-## 1.1.0 — Mercoxit and Launcher 1.0.94
+## Mercoxit and configuration layout
 
 The optional Mercoxit sites setting adds the native Enormous Mercoxit Deposit (client dungeon 12986) for each online level 3 Prospecting Array. The initial site is immediate. Reserve sites accumulate at the configured whole-hour interval (default 12), up to Max queued (default 3, excluding the active site). The timer pauses at capacity and resumes when a reserve is consumed. Zero hours enables immediate replacement; zero reserves means no stockpile. Queue records and absolute deadlines use the existing mod state file. Mercoxit uses a separate lifecycle from ordinary Array timers, scaling, grade distribution and escalation rolls.
 
-The optional settings-layout file groups related fields into rows for Launcher 1.0.94; narrow windows and older launchers may stack fields. The launcher documentation does not expose conditional visibility or read-only dynamic tables in this layout schema. Experimental update switching is not included because the baseline has no working update integration.
+The optional settings-layout file groups related fields into rows for Launcher 1.0.94; narrow windows and older launchers may stack fields. The launcher documentation does not expose conditional visibility or read-only dynamic tables in this layout schema. Experimental update switching is not included.
 
 Validation: loader syntax, transformed native source syntax, queue arithmetic and layout references checked. Live native/Docker lifecycle and inter-mod compatibility are not verified.
 
-## Industrial index (development)
+## Industrial index
 Independent progression and decay toggles default off; both rates default 1. Progression credits successful nonduplicate persistent player mining cargo settlements, excluding waste, using the historical volume thresholds 1.5/3/6/12/24 million m³ mapped to native index levels. Decay is compounded by elapsed time, checked hourly and at mining settlements; matching saved ownership, points and rate are required for offline catch-up. Launcher 1.0.94 does not document computed read-only fields; decay rate is labeled directly as percent per day. Both rates accept 0–100 in 0.01 steps. Mission and nonpersistent mining paths are not covered.
 
-## 1.2.0
-Adds optional shared Index Points (`globalThis.__nullsecUpgrades.getIndexPoints(systemID)`), startup escalation and local resource bonuses, count-only escalation queues (legacy queue migrated), shared deadline scheduler, teardown deduplication and 60-second mining credit batching. Native sovereignty writes are batched, so visible progression can lag by up to 60 seconds. A crash between queue reservation and site creation can lose one queued site. Existing guarded native source transformations remain; live integration testing is required. No experimental update channel is configured.
+## Shared index and lifecycle
+Includes optional shared Index Points (`globalThis.__nullsecUpgrades.getIndexPoints(systemID)`), startup escalation and local resource bonuses, count-only escalation queues (legacy queue migrated), shared deadline scheduler, teardown deduplication and 60-second mining credit batching. Native sovereignty writes are batched, so visible progression can lag by up to 60 seconds. A crash between queue reservation and site creation can lose one queued site. Existing guarded native source transformations remain; live integration testing is required. No experimental update channel is configured.
 
 
-## 1.2.1 — Diagnostics and operational guide
+## Diagnostics and operational guide
 
 Install the ZIP using the EveJS Launcher mod import workflow, enable Nullsec upgrades, configure it and restart the game server. The package declares native and Docker support and uses loader-rename activation. Do not rename the disabled loader manually when using the launcher. Preserve the configuration and state files across container recreation; back them up before upgrading. All settings require a server restart. Do not run two versions simultaneously.
 
@@ -118,3 +110,7 @@ All require Commands and staff access. `/nukeminingsites local` and `/nukemining
 ### Troubleshooting and limitations
 
 Pending is expected until the relevant event occurs. Strict size, tier distribution, respawn timing and final resource accounting do not yet have independent end-to-end validation. Some checks verify arithmetic or a native readback only. Existing hook failure isolation is retained; diagnostic failures do not automatically disable gameplay. If a source transform is rejected, inspect verbose output and test with other anomaly mods disabled before reporting a conflict. If the journal cannot be loaded, preserve a copy rather than deleting it blindly. No live native/Docker test was performed for 1.2.1. Experimental updates remain unimplemented. No GitHub publication.
+
+## Forced feature checks
+
+In the Feature Validation tab, use Run Test beside an enabled feature or Test All. Staff access and Verbose Logging must both be enabled. Refresh only reads cached results. The test command uses the settings loaded at server startup (not any un-applied configuration edits), executes actual mod code in an isolated in-memory fixture with a simulated clock, checks relevant native source transformations, and inspects live hook registration separately. The fixture does not receive live native write APIs, real persistence, or real timers; its fake database, sites, and notifications are discarded. It never depletes, spawns, purges or changes real sites, indices, queues or resources. The runner is loaded only on a permitted explicit test request, not at startup or with Verbose Logging off. Tests use one RPC per request; repeated requests within 500 ms of completion return cached results. The UI displays forced-test result, live hook readiness, and naturally observed runtime evidence separately. A passing isolated test is not proof of full live client/gameplay behavior. No additional background timers, diagnostic storage writes or polling are introduced. Actual live client rendering and integration tests remain pending.

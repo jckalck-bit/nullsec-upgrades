@@ -1,9 +1,9 @@
 {
   "schemaVersion": 3,
   "id": "nullsec-upgrades",
-  "displayName": "Nullsec upgrades",
-  "version": "1.2.2",
-  "description": "Sovereignty mining upgrades, persistent respawn timers, mining escalations, and optional automatic planetary resources.",
+  "displayName": "Nullsec Upgrades",
+  "version": "1.2.3",
+  "description": "Sovereignty mining upgrades, persistent respawn timers, mining escalations, and optional automatic planetary resources. For EveJS 261126.2 / Launcher 1.0.97.",
   "kind": "loader",
   "supportedBackends": [
     "native",
@@ -427,7 +427,7 @@
       {
         "id": "indexPoints",
         "label": "Index points",
-        "description": "Expose the combined sovereignty index levels (0\u201315) to other mods.",
+        "description": "Expose the combined sovereignty index levels (0–15) to other mods.",
         "group": "Sovereignty index benefits",
         "type": "boolean",
         "default": false,
@@ -505,7 +505,7 @@
       {
         "id": "verboseLogging",
         "label": "Verbose Logging",
-        "description": "Enable mod logging; OFF suppresses mod logs.",
+        "description": "Enable mod logs, passive diagnostic evidence, and staff-only on-demand feature tests. OFF disables diagnostics and hides the debug menu.",
         "group": "General settings",
         "type": "boolean",
         "default": false,
